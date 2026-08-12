@@ -55,7 +55,12 @@
                 @keydown.esc.stop.prevent="cancelField"
                 @blur="cancelField"
               />
-              <button v-else type="button" class="editable-value" @click="startFieldEdit('username')">
+              <button
+                v-else
+                type="button"
+                class="editable-value"
+                @click="startFieldEdit('username')"
+              >
                 {{ userStore.username || '未设置' }}
               </button>
             </div>
@@ -367,7 +372,7 @@ watch(() => [userStore.username, userStore.phoneNumber], syncProfileDraft, { imm
     min-width: 0;
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: 6px;
     flex: 1;
   }
 

@@ -235,9 +235,7 @@ class SubagentRunService:
         }
         input_payload = {
             "model_spec": resolved_model_spec,
-            "tool_approval_mode": creator_run.input_payload.get(
-                "tool_approval_mode", DEFAULT_TOOL_APPROVAL_MODE
-            ),
+            "tool_approval_mode": creator_run.input_payload.get("tool_approval_mode", DEFAULT_TOOL_APPROVAL_MODE),
             "runtime": {key: value for key, value in runtime_payload.items() if value is not None},
         }
         subagent_input_message = input_message.with_metadata(
@@ -265,6 +263,8 @@ class SubagentRunService:
             persisted_input_message=persisted_input_message,
             created_by_run_id=creator_run.id,
             subagent_thread_relation_id=relation.id,
+            source="subagent",
+            channel="internal",
         )
 
     async def _ensure_child_conversation(

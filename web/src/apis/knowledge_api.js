@@ -304,18 +304,24 @@ export const graphBuildApi = {
     return apiAdminGet(graphBuildUrl(kbId, 'status'))
   },
 
+  getFailedChunks: async (kbId, limit = 10) => {
+    return apiAdminGet(`${graphBuildUrl(kbId, 'failed-chunks')}?limit=${limit}`)
+  },
+
   configure: async (kbId, data) => {
     return apiAdminPost(graphBuildUrl(kbId, 'config'), data)
   },
 
-  startIndex: async (kbId, batchSize = 20) => {
-    return apiAdminPost(graphBuildUrl(kbId, 'index'), {
-      batch_size: batchSize
-    })
+  startIndex: async (kbId) => {
+    return apiAdminPost(graphBuildUrl(kbId, 'index'), {})
   },
 
   reset: async (kbId, data) => {
     return apiAdminPost(graphBuildUrl(kbId, 'reset'), data)
+  },
+
+  reconcile: async (kbId, mode = 'failed') => {
+    return apiAdminPost(graphBuildUrl(kbId, 'reconcile'), { mode })
   }
 }
 
@@ -587,6 +593,10 @@ export const evaluationApi = {
 
   generateDataset: async (kbId, params) => {
     return apiAdminPost(`/api/evaluation/databases/${kbId}/datasets/generate`, params)
+  },
+
+  resumeDatasetGeneration: async (kbId, datasetId) => {
+    return apiAdminPost(`/api/evaluation/databases/${kbId}/datasets/${datasetId}/resume`, {})
   },
 
   runEvaluation: async (kbId, params) => {

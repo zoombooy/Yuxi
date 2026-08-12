@@ -144,6 +144,42 @@ def test_docker_mount_checks_use_file_and_skills_thread_ids(monkeypatch, tmp_pat
     assert backend._is_expected_skills_mount(container, "parent-thread") is False
 
 
+def test_docker_sandbox_mounts_shared_workspace_without_thread_history_projection(monkeypatch, tmp_path):
+    monkeypatch.setenv("PROVISIONER_BACKEND", "memory")
+    module = _load_module()
+    captured = []
+
+    class FakeContainer:
+        name = "yuxi-sandbox-sandbox-1"
+        status = "running"
+        attrs = {"State": {"Status": "running"}}
+
+        def reload(self):
+            return None
+
+    backend = _docker_backend(
+        module,
+        tmp_path,
+        lambda image, **kwargs: captured.append((image, kwargs)) or FakeContainer(),
+    )
+    monkeypatch.setattr(backend, "_get_container", lambda _sandbox_id: None)
+    monkeypatch.setattr(backend, "_ensure_network", backend._network_name)
+    monkeypatch.setattr(backend, "_ensure_user_data_writable", lambda _container: None)
+    monkeypatch.setattr(module, "wait_for_sandbox_ready", lambda _url, timeout_seconds: True)
+
+    backend.create("sandbox-1", "thread-1", "user-1")
+
+    volumes = captured[0][1]["volumes"]
+    destinations = {mount["bind"] for mount in volumes.values()}
+    assert destinations == {
+        "/home/gem/user-data/workspace",
+        "/home/gem/user-data/uploads",
+        "/home/gem/user-data/outputs",
+        "/home/gem/skills",
+    }
+    assert all("/agents/chats" not in destination for destination in destinations)
+
+
 def test_kubernetes_mount_check_uses_file_and_skills_thread_ids(monkeypatch):
     monkeypatch.setenv("PROVISIONER_BACKEND", "memory")
     module = _load_module()

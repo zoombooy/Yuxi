@@ -24,7 +24,6 @@ from deepagents.backends.protocol import (
 from deepagents.backends.sandbox import MAX_BINARY_BYTES, BaseSandbox
 from deepagents.backends.utils import _get_file_type
 
-from yuxi.agents.skills.service import sync_thread_readable_skills
 from yuxi.utils.logging_config import logger
 from yuxi.utils.paths import (
     OUTPUTS_DIR_NAME,
@@ -33,6 +32,7 @@ from yuxi.utils.paths import (
     VIRTUAL_SKILLS_PATH,
     WORKSPACE_DIR_NAME,
 )
+
 from .provider import get_sandbox_provider, sandbox_id_for_thread, sandbox_provisioner_token
 
 _USER_DATA_ROOT = "/" + VIRTUAL_PATH_PREFIX.strip("/")
@@ -179,6 +179,7 @@ class ProvisionerSandboxBackend(BaseSandbox):
         *,
         uid: str,
         readable_skills: list[str] | None = None,
+        skill_sources: dict[str, str] | None = None,
         file_thread_id: str | None = None,
         skills_thread_id: str | None = None,
     ):
@@ -196,6 +197,7 @@ class ProvisionerSandboxBackend(BaseSandbox):
             raise ValueError("uid is required for ProvisionerSandboxBackend")
 
         self._readable_skills = list(readable_skills or [])
+        self._skill_sources = dict(skill_sources or {})
         self._provider = get_sandbox_provider()
         self._id = sandbox_id_for_thread(self._file_thread_id, self._skills_thread_id, uid=self._uid)
         self._client: Any | None = None
@@ -222,7 +224,6 @@ class ProvisionerSandboxBackend(BaseSandbox):
         )
 
     def _get_client(self) -> Any:
-        sync_thread_readable_skills(self._skills_thread_id, self._readable_skills)
         connection = self._provider.get(
             self._thread_id,
             uid=self._uid,

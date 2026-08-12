@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from dataclasses import dataclass, field
 
@@ -424,6 +425,7 @@ async def process_agent_run(ctx, run_id: str):
         thread_id=thread_id,
     )
     terminal_set = False
+    pending_interrupt: tuple[dict, str | None] | None = None
 
     try:
         async with pg_manager.get_async_session_context() as db:
@@ -458,7 +460,13 @@ async def process_agent_run(ctx, run_id: str):
                     await writer.flush(target_thread_id)
                     status = chunk.get("status") or "event"
                     event_type, event_payload = _map_chunk_to_run_event(chunk)
-                    if event_type != "end":
+                    is_parent_approval = target_thread_id == thread_id and status in {
+                        "ask_user_question_required",
+                        "human_approval_required",
+                    }
+                    if is_parent_approval:
+                        pending_interrupt = (chunk, target_thread_id)
+                    elif event_type != "end":
                         await append_run_event(run_id, event_type, event_payload, thread_id=target_thread_id)
 
                     if await run_ctx.is_cancelled():
@@ -496,29 +504,35 @@ async def process_agent_run(ctx, run_id: str):
                             error_message=chunk.get("message"),
                         )
                         terminal_set = transition.status is not None
-                    elif status in {"ask_user_question_required", "human_approval_required"}:
-                        questions = chunk.get("questions") if isinstance(chunk, dict) else None
-                        first_question = ""
-                        if isinstance(questions, list) and questions:
-                            first = questions[0]
-                            if isinstance(first, dict):
-                                first_question = str(first.get("question") or "").strip()
-
-                        transition = await _finish_run(
-                            run_id,
-                            "interrupted",
-                            thread_id=thread_id,
-                            chunk=chunk,
-                            error_type=status,
-                            error_message=(
-                                "需要用户审批工具操作"
-                                if status == "human_approval_required"
-                                else first_question or "需要用户回答问题"
-                            ),
-                        )
-                        terminal_set = transition.status is not None
 
         await writer.flush()
+        if pending_interrupt and not terminal_set:
+            interrupt_chunk, interrupt_thread_id = pending_interrupt
+            event_type, event_payload = _map_chunk_to_run_event(interrupt_chunk)
+            await append_run_event(run_id, event_type, event_payload, thread_id=interrupt_thread_id)
+
+            questions = interrupt_chunk.get("questions")
+            first_question = ""
+            if isinstance(questions, list) and questions:
+                first = questions[0]
+                if isinstance(first, dict):
+                    first_question = str(first.get("question") or "").strip()
+
+            interrupt_status = interrupt_chunk.get("status")
+            transition = await _finish_run(
+                run_id,
+                "interrupted",
+                thread_id=thread_id,
+                chunk=interrupt_chunk,
+                error_type=interrupt_status,
+                error_message=(
+                    "需要用户审批工具操作"
+                    if interrupt_status == "human_approval_required"
+                    else first_question or "需要用户回答问题"
+                ),
+            )
+            terminal_set = transition.status is not None
+
         if not terminal_set:
             if await run_ctx.is_cancelled():
                 raise asyncio.CancelledError(f"run {run_id} cancelled")
@@ -631,18 +645,25 @@ async def _load_input_message(message_id: int | None) -> Message | None:
 
 
 async def _worker_startup(ctx):
-    del ctx
+    """初始化 worker 依赖。"""
+
     pg_manager.initialize()
     await pg_manager.create_business_tables()
     await pg_manager.ensure_business_schema()
     await ensure_builtin_mcp_servers_in_db()
     async with pg_manager.get_async_session_context() as session:
         await init_builtin_skills(session)
+        from yuxi.config.options import ensure_options_in_db
+
+        await ensure_options_in_db(session)
     sys_config.start_runtime_sync()
     await recover_pending_dispatches()
 
 
 async def _worker_shutdown(ctx):
+    """关闭 worker 数据库连接。"""
+
+    del ctx
     await pg_manager.close()
 
 
@@ -650,7 +671,9 @@ class WorkerSettings:
     functions = [process_agent_run]
     max_tries = 2
     retry_jobs = True
-    job_timeout = 3600
+    # 单任务最长执行时间（秒），可配置：超长图谱构建/深度检索场景需调大，
+    # 避免长任务被 arq 取消并误标为 cancelled。
+    job_timeout = int(os.getenv("YUXI_JOB_TIMEOUT_SECONDS", "3600"))
     keep_result = 60
     on_startup = _worker_startup
     on_shutdown = _worker_shutdown

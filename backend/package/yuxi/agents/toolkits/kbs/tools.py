@@ -104,21 +104,11 @@ async def get_mindmap(kb_name: str, runtime: ToolRuntime) -> str:
     if not kb_name:
         return "请提供知识库名称"
 
-    # 获取所有检索器
-    knowledge_base = _get_knowledge_base()
-    retrievers = knowledge_base.get_retrievers()
-
-    # 查找对应的知识库
-    target_kb_id = None
-    target_info = None
-    for kb_id, info in retrievers.items():
-        if info["name"] == kb_name:
-            target_kb_id = kb_id
-            target_info = info
-            break
-
-    if not target_kb_id:
-        return f"知识库 '{kb_name}' 不存在"
+    visible_kbs = await _resolve_visible_knowledge_bases_for_query(runtime)
+    target_info = next((kb for kb in visible_kbs if kb.get("name") == kb_name), None)
+    if not target_info:
+        return f"知识库 '{kb_name}' 不存在或当前会话未启用"
+    target_kb_id = target_info["kb_id"]
 
     try:
         from yuxi.repositories.knowledge_base_repository import KnowledgeBaseRepository

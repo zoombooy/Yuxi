@@ -6,7 +6,7 @@ from langchain.agents.middleware import ModelRetryMiddleware, TodoListMiddleware
 from langchain.agents.middleware.types import AgentMiddleware
 
 from yuxi.agents import BaseAgent, BaseState, load_chat_model, resolve_chat_model_spec
-from yuxi.agents.backends import create_agent_filesystem_middleware
+from yuxi.agents.backends import create_agent_filesystem_middleware, sync_agent_context_skills
 from yuxi.agents.buildin.chatbot.prompt import TODO_MID_PROMPT, build_prompt_with_context
 from yuxi.agents.buildin.subagent.context import SubAgentContext
 from yuxi.agents.context import (
@@ -25,8 +25,8 @@ from yuxi.agents.middlewares import (
     save_attachments_to_fs,
 )
 from yuxi.agents.middlewares.skills import SkillsMiddleware
-from yuxi.agents.toolkits.service import resolve_configured_runtime_tools
 from yuxi.agents.tool_approval import SENSITIVE_BACKEND_TOOLS, normalize_tool_approval_mode
+from yuxi.agents.toolkits.service import resolve_configured_runtime_tools
 
 _SUBAGENT_DISABLED_TOOLS = frozenset({"present_artifacts", "ask_user_question", "install_skill"})
 # 默认审批模式额外隐藏敏感 backend 工具，避免子智能体绕过主线程逐项审批。
@@ -60,9 +60,7 @@ class _SubAgentToolFilterMiddleware(AgentMiddleware[Any, Any, Any]):
         return handler(request.override(tools=_filter_disabled_tools(request.tools or [], self.disabled_tools)))
 
     async def awrap_model_call(self, request, handler):
-        return await handler(
-            request.override(tools=_filter_disabled_tools(request.tools or [], self.disabled_tools))
-        )
+        return await handler(request.override(tools=_filter_disabled_tools(request.tools or [], self.disabled_tools)))
 
 
 async def _build_middlewares(context, tool_approval_mode: str):
@@ -138,6 +136,7 @@ class SubAgentBackend(BaseAgent):
             context or self.context_schema(),
             context_schema=self.context_schema,
         )
+        await sync_agent_context_skills(context)
         model_spec = resolve_chat_model_spec(context.model)
         tool_approval_mode = normalize_tool_approval_mode(getattr(context, "tool_approval_mode", "default"))
         disabled_tools = _disabled_tools_for(tool_approval_mode)

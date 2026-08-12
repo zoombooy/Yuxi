@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 from yuxi.utils.logging_config import logger
 
+from .paths import workspace_uid_dirname
 from .provisioner_client import ProvisionerClient, SandboxRecord
 
 
@@ -173,7 +174,7 @@ class ProvisionerSandboxProvider:
             record = self._client.create(
                 sandbox_id,
                 thread_id,
-                uid,
+                workspace_uid_dirname(uid),
                 load_user_agent_env(uid),
                 file_thread_id=file_id,
                 skills_thread_id=skills_id,
@@ -221,7 +222,7 @@ class ProvisionerSandboxProvider:
                 record = self._client.create(
                     sandbox_id,
                     thread_id,
-                    uid,
+                    workspace_uid_dirname(uid),
                     load_user_agent_env(uid),
                     file_thread_id=file_id,
                     skills_thread_id=skills_id,
