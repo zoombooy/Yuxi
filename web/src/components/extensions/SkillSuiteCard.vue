@@ -10,13 +10,6 @@
 
     <p class="suite-card-description">{{ suite.description }}</p>
 
-    <div class="suite-card-members" aria-label="套件成员">
-      <span v-for="skill in visibleSkills" :key="skill.slug" class="suite-member-tag">
-        {{ skill.name }}
-      </span>
-      <span v-if="hiddenCount" class="suite-member-tag">+{{ hiddenCount }}</span>
-    </div>
-
     <div class="suite-card-footer">
       <span class="suite-card-status">{{ statusText }}</span>
       <span class="suite-card-action">
@@ -29,7 +22,7 @@
 
 <script setup>
 import { computed } from 'vue'
-import { Boxes, ChevronRight } from 'lucide-vue-next'
+import { Boxes, ChevronRight } from '@lucide/vue'
 
 const props = defineProps({
   suite: { type: Object, required: true },
@@ -45,10 +38,6 @@ const installedCount = computed(
   () =>
     props.suite.skills.filter((skill) => installedSet.value.has(skill.slug.toLowerCase())).length
 )
-const visibleSkills = computed(() => props.suite.skills.slice(0, 4))
-const hiddenCount = computed(() =>
-  Math.max(0, props.suite.skills.length - visibleSkills.value.length)
-)
 const statusText = computed(() => {
   if (installedCount.value === props.suite.skills.length) return '已全部安装'
   if (installedCount.value > 0) return `已安装 ${installedCount.value}/${props.suite.skills.length}`
@@ -61,7 +50,7 @@ const statusText = computed(() => {
   display: flex;
   flex-direction: column;
   width: 100%;
-  min-height: 196px;
+  min-height: 170px;
   padding: 18px;
   border: 1px solid var(--gray-150);
   border-radius: 8px;
@@ -133,29 +122,12 @@ const statusText = computed(() => {
   -webkit-line-clamp: 2;
 }
 
-.suite-card-members {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.suite-member-tag {
-  padding: 2px 7px;
-  border: 1px solid var(--gray-150);
-  border-radius: 999px;
-  background: var(--gray-25);
-  color: var(--gray-600);
-  font-size: 11px;
-  line-height: 18px;
-}
-
 .suite-card-footer {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
   margin-top: auto;
-  padding-top: 14px;
 }
 
 .suite-card-status {

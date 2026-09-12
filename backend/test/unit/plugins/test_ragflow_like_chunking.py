@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import os
-import sys
+import random
 
-sys.path.append(os.getcwd())
-
+import pytest
+from yuxi.knowledge.chunking.ragflow_like import nlp
 from yuxi.knowledge.chunking.ragflow_like.dispatcher import chunk_markdown
 from yuxi.knowledge.chunking.ragflow_like.nlp import bullets_category, count_tokens
-from yuxi.knowledge.chunking.ragflow_like.utils.semantic_utils import split_sentences_chinese
 from yuxi.knowledge.chunking.ragflow_like.presets import (
     CHUNK_ENGINE_VERSION,
     CHUNK_PRESET_IDS,
@@ -17,6 +15,7 @@ from yuxi.knowledge.chunking.ragflow_like.presets import (
     map_to_internal_parser_id,
     resolve_chunk_processing_params,
 )
+from yuxi.knowledge.chunking.ragflow_like.utils.semantic_utils import split_mixed_sentences, split_sentences_chinese
 from yuxi.knowledge.utils.kb_utils import resolve_processing_params, sanitize_processing_params
 
 
@@ -78,9 +77,10 @@ def test_qa_chunking_from_markdown_headings() -> None:
         processing_params={"chunk_preset_id": "qa", "chunk_parser_config": {}},
     )
 
-    assert len(chunks) >= 1
-    assert "问题：" in chunks[0]["content"]
-    assert "回答：" in chunks[0]["content"]
+    assert [chunk["content"] for chunk in chunks] == [
+        "问题：问题一\t回答：这是答案一。",
+        "问题：问题一\n子问题\t回答：这是答案二。",
+    ]
 
 
 def test_chunk_records_include_reserved_position_fields() -> None:
@@ -103,7 +103,10 @@ def test_chunk_records_include_reserved_position_fields() -> None:
     assert "start_char_pos" in chunks[1]
 
 
-def test_book_chunking_hierarchical_merge() -> None:
+@pytest.mark.parametrize("seed", [0, 94])
+def test_book_chunking_hierarchical_merge(monkeypatch, seed) -> None:
+    """抽样不得遗漏短文档标题，导致同一文档随机丢失分节。"""
+    monkeypatch.setattr(nlp, "random", random.Random(seed))
     content = """
 第一章 总则
 第一节 适用范围
@@ -119,30 +122,53 @@ def test_book_chunking_hierarchical_merge() -> None:
         processing_params={"chunk_preset_id": "book", "chunk_parser_config": {"chunk_token_num": 256}},
     )
 
-    assert len(chunks) >= 1
-    assert any("第一章" in ck["content"] for ck in chunks)
+    assert [chunk["content"] for chunk in chunks] == [
+        "第一章 总则\n第一节 适用范围\n本规范适用于测试场景。",
+        "第一章 总则\n第二节 基本原则\n应当遵循最小改动原则。",
+    ]
 
 
-def test_book_chunking_should_apply_overlength_protection() -> None:
-    content = "\n".join(
-        [
-            "第一章 总则",
-            "第一节 适用范围",
-            "超长正文" * 1200,
-            "第二节 基本原则",
-            "应当遵循最小改动原则。",
-        ]
-    )
+@pytest.mark.parametrize(
+    ("preset_id", "file_id", "filename", "content", "parser_config"),
+    [
+        (
+            "book",
+            "file_book_long",
+            "book.txt",
+            "\n".join(
+                [
+                    "第一章 总则",
+                    "第一节 适用范围",
+                    "超长正文" * 1200,
+                    "第二节 基本原则",
+                    "应当遵循最小改动原则。",
+                ]
+            ),
+            {"chunk_token_num": 180, "delimiter": "\\n"},
+        ),
+        (
+            "laws",
+            "file_laws_long",
+            "laws.docx",
+            "\n".join(
+                ["#### 中华人民共和国企业所得税法实施条例", "##### 微信扫一扫：分享"]
+                + [
+                    f"第{i}条 企业所得税法实施细则说明，适用于测试场景，确保条文长度足够用于验证分块策略。"
+                    for i in range(1, 260)
+                ]
+            ),
+            {"chunk_token_num": 180, "overlapped_percent": 20, "delimiter": "\\n"},
+        ),
+    ],
+)
+def test_chunking_should_apply_overlength_protection(preset_id, file_id, filename, content, parser_config) -> None:
     max_chunk_tokens = 180
 
     chunks = chunk_markdown(
         markdown_content=content,
-        file_id="file_book_long",
-        filename="book.txt",
-        processing_params={
-            "chunk_preset_id": "book",
-            "chunk_parser_config": {"chunk_token_num": max_chunk_tokens, "delimiter": "\\n"},
-        },
+        file_id=file_id,
+        filename=filename,
+        processing_params={"chunk_preset_id": preset_id, "chunk_parser_config": parser_config},
     )
 
     assert len(chunks) > 1
@@ -156,24 +182,41 @@ def test_split_sentences_chinese_should_keep_quote_boundary() -> None:
     assert sentences == ["他说：“你好。”", "然后问：“你在吗？”", "最后结束！"]
 
 
-def test_markdown_heading_has_higher_weight_in_bullet_category() -> None:
-    sections = [
-        "# 3.2 个人所得项目及计税、申报方式概括",
-        "一、关于季节工、临时工等费用税前扣除问题，以下规定继续执行。",
-        "二、根据现行规定，补贴收入应并入工资薪金所得。",
-        "（一）从超出国家规定比例支付的补贴，不属于免税福利费。",
+def test_split_mixed_sentences_handles_english_abbreviations_without_external_tokenizer() -> None:
+    text = "Dr. Smith arrived at 3.14 p.m. He left."
+
+    assert split_mixed_sentences(text) == ["Dr. Smith arrived at 3.14 p.m.", "He left."]
+    assert split_mixed_sentences("The U.S. Government acted. Next sentence.") == [
+        "The U.S. Government acted.",
+        "Next sentence.",
+    ]
+    assert split_mixed_sentences("I live in the U.S. Next sentence.") == [
+        "I live in the U.S.",
+        "Next sentence.",
+    ]
+    assert split_mixed_sentences("He listed items, etc. Next sentence.") == [
+        "He listed items, etc.",
+        "Next sentence.",
     ]
 
-    # 命中 markdown 标题模式（BULLET_PATTERN 下标 4）时，应该优先选中该组。
-    assert bullets_category(sections) == 4
 
-
-def test_mid_sentence_bullet_marker_should_not_be_treated_as_heading() -> None:
-    sections = [
-        "根据前述规则：一、这里是句中枚举，不是章节标题，不能被当成层级。",
-        "延续上文：（二）这里同样是正文中的枚举表达，不是独立标题。",
-        "## 3.4 交通补贴的个税处理",
-    ]
+@pytest.mark.parametrize(
+    "sections",
+    [
+        [
+            "# 3.2 个人所得项目及计税、申报方式概括",
+            "一、关于季节工、临时工等费用税前扣除问题，以下规定继续执行。",
+            "二、根据现行规定，补贴收入应并入工资薪金所得。",
+            "（一）从超出国家规定比例支付的补贴，不属于免税福利费。",
+        ],
+        [
+            "根据前述规则：一、这里是句中枚举，不是章节标题，不能被当成层级。",
+            "延续上文：（二）这里同样是正文中的枚举表达，不是独立标题。",
+            "## 3.4 交通补贴的个税处理",
+        ],
+    ],
+)
+def test_bullet_category_prefers_markdown_heading(sections) -> None:
     assert bullets_category(sections) == 4
 
 
@@ -187,57 +230,6 @@ def test_chunk_preset_options_include_description() -> None:
 def test_chunk_preset_defaults_only_include_strategy_specific_fields() -> None:
     for preset_id in CHUNK_PRESET_IDS:
         assert get_default_chunk_parser_config(preset_id) == {}
-
-
-def test_laws_chunking_should_apply_overlength_protection() -> None:
-    lines = ["#### 中华人民共和国企业所得税法实施条例", "##### 微信扫一扫：分享"]
-    lines.extend(
-        [f"第{i}条 企业所得税法实施细则说明，适用于测试场景，确保条文长度足够用于验证分块策略。" for i in range(1, 260)]
-    )
-    content = "\n".join(lines)
-
-    max_chunk_tokens = 180
-    chunks = chunk_markdown(
-        markdown_content=content,
-        file_id="file_laws_long",
-        filename="laws.docx",
-        processing_params={
-            "chunk_preset_id": "laws",
-            "chunk_parser_config": {
-                "chunk_token_num": max_chunk_tokens,
-                "overlapped_percent": 20,
-                "delimiter": "\\n",
-            },
-        },
-    )
-
-    assert len(chunks) > 1
-    assert max(count_tokens(ck["content"]) for ck in chunks) <= max_chunk_tokens
-
-
-def test_laws_chunking_should_prefer_sentence_boundary_split() -> None:
-    line = "第一条 企业所得税法实施细则用于测试分块语义边界。"
-    content = line * 120
-
-    chunks = chunk_markdown(
-        markdown_content=content,
-        file_id="file_laws_sentence",
-        filename="laws.docx",
-        processing_params={
-            "chunk_preset_id": "laws",
-            "chunk_parser_config": {
-                "chunk_token_num": 120,
-                "overlapped_percent": 0,
-                "delimiter": "\\n",
-            },
-        },
-    )
-
-    assert len(chunks) > 1
-    for ck in chunks:
-        text = ck["content"].strip()
-        assert text
-        assert count_tokens(text) <= 120
 
 
 def test_laws_chunking_should_prefer_article_level_before_item_level() -> None:

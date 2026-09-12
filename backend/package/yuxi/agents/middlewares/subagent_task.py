@@ -11,6 +11,7 @@ from langchain_core.messages import ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.prebuilt.tool_node import ToolRuntime
 from langgraph.types import Command
+from pydantic import BaseModel
 
 from yuxi.repositories.agent_repository import AgentRepository
 from yuxi.repositories.agent_run_repository import TERMINAL_RUN_STATUSES
@@ -18,6 +19,9 @@ from yuxi.repositories.user_repository import UserRepository
 from yuxi.services.input_message_service import build_chat_input_message
 from yuxi.storage.postgres.manager import pg_manager
 from yuxi.storage.postgres.models_business import Agent
+
+# 五个内建工具的签名固定；仅复用参数类型，闭包与父 Run 仍逐次创建。
+_TOOL_INPUT_SCHEMAS: dict[str, type[BaseModel]] = {}
 
 
 def _subagent_run_service_module():
@@ -28,7 +32,15 @@ def _subagent_run_service_module():
 
 def _async_only_tool(*, name: str, coroutine: Callable[..., Awaitable[Any]], description: str) -> StructuredTool:
     """后台子智能体工具只在异步链路执行；仅声明 coroutine，同步调用由 LangChain 直接报错。"""
-    return StructuredTool.from_function(name=name, coroutine=coroutine, description=description, infer_schema=True)
+    tool = StructuredTool.from_function(
+        name=name,
+        coroutine=coroutine,
+        description=description,
+        args_schema=_TOOL_INPUT_SCHEMAS.get(name),
+        infer_schema=True,
+    )
+    _TOOL_INPUT_SCHEMAS.setdefault(name, tool.args_schema)
+    return tool
 
 
 TASK_SYSTEM_PROMPT = """## `task`（子智能体任务工具）
@@ -387,12 +399,9 @@ class YuxiSubAgentMiddleware(AgentMiddleware[Any, ContextT, ResponseT]):
 
     def _parent_runtime(self) -> _ParentRuntime:
         """从父智能体 context 中抽取子智能体运行所需的最小父运行信息。"""
-        parent_thread_id = str(getattr(self.parent_context, "parent_thread_id", None) or self.parent_context.thread_id)
-        file_thread_id = str(getattr(self.parent_context, "file_thread_id", None) or parent_thread_id)
         uid = str(getattr(self.parent_context, "uid", "") or "").strip()
         created_by_run_id = str(getattr(self.parent_context, "run_id", "") or "").strip()
         return _ParentRuntime(
-            file_thread_id=file_thread_id,
             uid=uid,
             created_by_run_id=created_by_run_id,
         )
@@ -438,11 +447,11 @@ class YuxiSubAgentMiddleware(AgentMiddleware[Any, ContextT, ResponseT]):
                     input_message=input_message,
                     tool_call_id=runtime.tool_call_id,
                     requested_thread_id=thread_id,
-                    file_thread_id=parent_runtime.file_thread_id,
                     model_spec=self._subagent_model_override(agent_item),
                 )
         except subagent_service.SubagentRunBusy as exc:
-            return None, _json_tool_command(exc.to_payload(), runtime.tool_call_id)
+            payload = exc.to_payload()
+            return None, _json_tool_command(payload, runtime.tool_call_id)
         except ValueError as exc:
             return None, str(exc)
         return _StartedSubagent(result=result, parent_runtime=parent_runtime, agent_item=agent_item), None
@@ -472,7 +481,6 @@ class YuxiSubAgentMiddleware(AgentMiddleware[Any, ContextT, ResponseT]):
 
 @dataclass(frozen=True)
 class _ParentRuntime:
-    file_thread_id: str
     uid: str
     created_by_run_id: str
 

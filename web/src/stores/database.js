@@ -8,6 +8,12 @@ import { useRouter } from 'vue-router'
 import { parseToShanghai } from '@/utils/time'
 import { canSelectFile, isProcessingFile } from '@/utils/knowledge_file_policy'
 
+// 自动轮询参数：链式调度（等上一轮请求全部返回后再排下一轮），处理中文件长时间无进展时按 2 倍退避并最终自动停止；
+// 基础间隔与后端文件统计缓存节奏（10s）对齐，避免高频请求重复全表聚合
+const AUTO_REFRESH_POLL_INTERVAL_MS = 10000
+const AUTO_REFRESH_MAX_INTERVAL_MS = 30000
+const AUTO_REFRESH_STALE_POLLS_LIMIT = 6
+
 export const useDatabaseStore = defineStore('database', () => {
   const router = useRouter()
   const taskerStore = useTaskerStore()
@@ -49,9 +55,14 @@ export const useDatabaseStore = defineStore('database', () => {
     rightPanelVisible: true
   })
 
-  let refreshInterval = null
   let autoRefreshSource = null // Tracks whether auto-refresh was user-triggered or automatic
   let autoRefreshManualOverride = false // Indicates user explicitly disabled auto-refresh
+  // 自动轮询状态：refreshTimer 保存链式调度的定时器；refreshGeneration 用于废弃过期轮询轮次
+  let refreshTimer = null
+  let refreshGeneration = 0
+  let refreshStablePolls = 0
+  let refreshIntervalMs = AUTO_REFRESH_POLL_INTERVAL_MS
+  let refreshLastProcessingCount = null
   let fileBrowserContextId = 0
 
   function setCurrentFileMap(items = []) {
@@ -463,6 +474,7 @@ export const useDatabaseStore = defineStore('database', () => {
   }
 
   async function addFiles({ items, contentType, params, parentId }) {
+    const registerTask = taskerStore.createTaskRegistration()
     if (items.length === 0) {
       message.error(contentType === 'file' ? '请先上传文件' : '请输入有效的网页链接')
       return
@@ -480,7 +492,7 @@ export const useDatabaseStore = defineStore('database', () => {
         enableAutoRefresh('auto')
         message.success(data.message || `${itemType}已提交处理，请在任务中心查看进度`)
         if (data.task_id) {
-          taskerStore.registerQueuedTask({
+          registerTask({
             task_id: data.task_id,
             name: `知识库导入 (${kbId.value || ''})`,
             task_type: 'knowledge_ingest',
@@ -507,21 +519,22 @@ export const useDatabaseStore = defineStore('database', () => {
     }
   }
 
-  async function parseFiles(fileIds) {
+  async function parseFiles(fileIds, params = {}) {
+    const registerTask = taskerStore.createTaskRegistration()
     if (fileIds.length === 0) return
     state.chunkLoading = true
     try {
-      const data = await documentApi.parseDocuments(kbId.value, fileIds)
+      const data = await documentApi.parseDocuments(kbId.value, fileIds, params)
       if (data.status === 'success' || data.status === 'queued') {
         enableAutoRefresh('auto')
         message.success(data.message || '解析任务已提交')
         if (data.task_id) {
-          taskerStore.registerQueuedTask({
+          registerTask({
             task_id: data.task_id,
             name: `文档解析 (${kbId.value})`,
             task_type: 'knowledge_parse',
             message: data.message,
-            payload: { kb_id: kbId.value, count: fileIds.length }
+            payload: { kb_id: kbId.value, count: fileIds.length, params }
           })
         }
         await delayedRefresh() // 延迟1秒后刷新
@@ -539,20 +552,28 @@ export const useDatabaseStore = defineStore('database', () => {
     }
   }
 
-  async function parsePendingFiles(count = 0) {
+  async function parsePendingFiles(paramsOrCount = {}, count = 0) {
+    const registerTask = taskerStore.createTaskRegistration()
+    const params = typeof paramsOrCount === 'number' ? {} : paramsOrCount || {}
+    const totalCount = typeof paramsOrCount === 'number' ? paramsOrCount : count
     state.chunkLoading = true
     try {
-      const data = await documentApi.parsePendingDocuments(kbId.value)
+      const data = await documentApi.parsePendingDocuments(kbId.value, params)
       if (data.status === 'success' || data.status === 'queued') {
         enableAutoRefresh('auto')
         message.success(data.message || '解析任务已提交')
         if (data.task_id) {
-          taskerStore.registerQueuedTask({
+          registerTask({
             task_id: data.task_id,
             name: `文档解析 (${kbId.value})`,
             task_type: 'knowledge_parse',
             message: data.message,
-            payload: { kb_id: kbId.value, count: data.queued_count || count, scope: 'pending' }
+            payload: {
+              kb_id: kbId.value,
+              count: data.queued_count || totalCount,
+              scope: 'pending',
+              params
+            }
           })
         }
         await delayedRefresh()
@@ -571,6 +592,7 @@ export const useDatabaseStore = defineStore('database', () => {
   }
 
   async function indexFiles(fileIds, params = {}) {
+    const registerTask = taskerStore.createTaskRegistration()
     if (fileIds.length === 0) return
     state.chunkLoading = true
     try {
@@ -579,7 +601,7 @@ export const useDatabaseStore = defineStore('database', () => {
         enableAutoRefresh('auto')
         message.success(data.message || '入库任务已提交')
         if (data.task_id) {
-          taskerStore.registerQueuedTask({
+          registerTask({
             task_id: data.task_id,
             name: `文档入库 (${kbId.value})`,
             task_type: 'knowledge_index',
@@ -603,6 +625,7 @@ export const useDatabaseStore = defineStore('database', () => {
   }
 
   async function indexPendingFiles(params = {}, count = 0) {
+    const registerTask = taskerStore.createTaskRegistration()
     state.chunkLoading = true
     try {
       const data = await documentApi.indexPendingDocuments(kbId.value, params)
@@ -610,7 +633,7 @@ export const useDatabaseStore = defineStore('database', () => {
         enableAutoRefresh('auto')
         message.success(data.message || '入库任务已提交')
         if (data.task_id) {
-          taskerStore.registerQueuedTask({
+          registerTask({
             task_id: data.task_id,
             name: `文档入库 (${kbId.value})`,
             task_type: 'knowledge_index',
@@ -681,19 +704,64 @@ export const useDatabaseStore = defineStore('database', () => {
     }
   }
 
-  function startAutoRefresh() {
-    if (state.autoRefresh && !refreshInterval) {
-      refreshInterval = setInterval(() => {
-        getDatabaseInfo(undefined, true, true) // Skip loading query params during auto-refresh
-        loadDocumentFiles({ isBackground: true })
-      }, 1000)
+  // 链式调度：等上一轮请求全部返回后再排下一轮，避免慢接口下请求堆积重叠
+  function scheduleAutoRefresh() {
+    refreshTimer = setTimeout(runAutoRefreshTick, refreshIntervalMs)
+  }
+
+  async function runAutoRefreshTick() {
+    const generation = refreshGeneration
+    refreshTimer = null
+    if (!state.autoRefresh) return
+
+    await Promise.all([
+      getDatabaseInfo(undefined, true, true), // Skip loading query params during auto-refresh
+      loadDocumentFiles({ isBackground: true })
+    ])
+
+    // 期间被重新 start/stop，本轮的退避结论作废
+    if (generation !== refreshGeneration) return
+    if (!state.autoRefresh) return
+
+    // 处理中文件数量持续不变则按 2 倍退避，达到上限仍无进展即自动停止（覆盖僵尸状态）
+    const processingCount = Number(database.value?.stats?.processing_count || 0)
+    if (processingCount === refreshLastProcessingCount) {
+      refreshStablePolls += 1
+      refreshIntervalMs = Math.min(refreshIntervalMs * 2, AUTO_REFRESH_MAX_INTERVAL_MS)
+    } else {
+      refreshStablePolls = 0
+      refreshIntervalMs = AUTO_REFRESH_POLL_INTERVAL_MS
     }
+    refreshLastProcessingCount = processingCount
+
+    if (refreshStablePolls >= AUTO_REFRESH_STALE_POLLS_LIMIT) {
+      state.autoRefresh = false
+      autoRefreshSource = null
+      autoRefreshManualOverride = false
+      stopAutoRefresh()
+      return
+    }
+    scheduleAutoRefresh()
+  }
+
+  function startAutoRefresh() {
+    if (!state.autoRefresh) return
+    refreshGeneration += 1
+    refreshStablePolls = 0
+    refreshIntervalMs = AUTO_REFRESH_POLL_INTERVAL_MS
+    refreshLastProcessingCount = Number(database.value?.stats?.processing_count || 0)
+    if (refreshTimer) {
+      clearTimeout(refreshTimer)
+      refreshTimer = null
+    }
+    scheduleAutoRefresh()
   }
 
   function stopAutoRefresh() {
-    if (refreshInterval) {
-      clearInterval(refreshInterval)
-      refreshInterval = null
+    refreshGeneration += 1
+    if (refreshTimer) {
+      clearTimeout(refreshTimer)
+      refreshTimer = null
     }
   }
 

@@ -33,6 +33,24 @@
         <Copy v-else size="12" />
       </span>
 
+      <!-- 对话结束时间 / 执行耗时：纯文本，紧挨复制按钮展示 -->
+      <span
+        v-if="messageFinishedAt"
+        class="time-entry"
+        :class="{ toggleable: hasMessageDuration }"
+        @click="toggleTimeDisplay"
+        :title="
+          hasMessageDuration
+            ? showingDuration
+              ? '点击显示结束时间'
+              : '点击显示执行耗时'
+            : '结束时间'
+        "
+      >
+        <span v-if="showingDuration && messageDurationLabel">{{ messageDurationLabel }}</span>
+        <span v-else>{{ messageFinishedAt }}</span>
+      </span>
+
       <!-- 重试 -->
       <span
         v-if="showKey('regenerate')"
@@ -102,14 +120,17 @@ import {
   RotateCcw,
   BookOpen,
   ChevronDown
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 import { agentApi } from '@/apis'
+import { formatChatTime } from '@/utils/time'
 import KnowledgeSourceSection from '@/components/KnowledgeSourceSection.vue'
 import WebSearchSourceSection from '@/components/WebSearchSourceSection.vue'
+import { formatRunTimingDuration, getRunTotalLatencyMs } from '@/utils/runTiming'
 
 const emit = defineEmits(['retry', 'openRefs'])
 const props = defineProps({
   message: Object,
+  run: { type: Object, default: null },
   showRefs: {
     type: [Array, Boolean],
     default: () => false
@@ -151,6 +172,25 @@ const feedbackState = reactive({
   reason: null
 })
 
+// 对话结束时间 / 执行耗时切换
+const showingDuration = ref(false)
+const messageFinishedAt = computed(() => {
+  const finishedAt = props.run?.timing?.finished_at || msg.value?.created_at
+  return finishedAt ? formatChatTime(finishedAt) : ''
+})
+const messageDurationMs = computed(() => {
+  return getRunTotalLatencyMs(props.run?.timing)
+})
+const hasMessageDuration = computed(() => messageDurationMs.value !== null)
+const messageDurationLabel = computed(() => {
+  const duration = formatRunTimingDuration(messageDurationMs.value)
+  return duration ? `耗时 ${duration}` : ''
+})
+const toggleTimeDisplay = () => {
+  if (!hasMessageDuration.value) return
+  showingDuration.value = !showingDuration.value
+}
+
 // 初始化反馈状态 - 从 antMessage.feedback 读取历史反馈
 const initFeedbackState = () => {
   if (msg.value?.feedback) {
@@ -170,6 +210,7 @@ watch(
   () => {
     msg.value = props.message
     initFeedbackState()
+    showingDuration.value = false
   },
   { immediate: true }
 )
@@ -405,6 +446,21 @@ const cancelDislike = () => {
         }
       }
     }
+
+    .time-entry {
+      color: var(--gray-400);
+      font-variant-numeric: tabular-nums;
+      user-select: none;
+
+      &.toggleable {
+        cursor: pointer;
+
+        &:hover {
+          color: var(--gray-700);
+        }
+      }
+    }
+
   }
 
   .sources-panel-body {

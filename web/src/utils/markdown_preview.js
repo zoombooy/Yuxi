@@ -3,11 +3,12 @@ import markdownItKatex from '@vscode/markdown-it-katex'
 import taskLists from 'markdown-it-task-lists'
 import DOMPurify from 'dompurify'
 import { createHighlighter } from 'shiki'
-import yaml from 'js-yaml'
-import { escapeHtml } from '@/utils/html'
-import { normalizeCodeLanguage } from '@/utils/file_preview'
-import { renderSvgBlocks } from './svgRenderer'
-import { renderHtmlPreviewBlocks } from './htmlPreviewRenderer'
+import { load as yamlLoad } from 'js-yaml'
+import { escapeHtml } from './html.js'
+import { normalizeCodeLanguage } from './file_preview.js'
+import { renderSvgBlocks } from './svgRenderer.js'
+import { renderHtmlPreviewBlocks } from './htmlPreviewRenderer.js'
+import { createMarkdownRenderCache } from './markdownRenderCache.js'
 
 const markdownKatexPlugin = markdownItKatex.default || markdownItKatex
 const FRONTMATTER_MARKER = '---'
@@ -109,7 +110,7 @@ const markdownItFrontmatterCard = (md) => {
     let data
 
     try {
-      data = yaml.load(rawYaml) || {}
+      data = yamlLoad(rawYaml) || {}
     } catch {
       return false
     }
@@ -129,8 +130,7 @@ const markdownItFrontmatterCard = (md) => {
 }
 
 const rendererCache = new Map()
-const renderedHtmlCache = new Map()
-const MAX_RENDER_CACHE_SIZE = 100
+const renderedHtmlCache = createMarkdownRenderCache()
 const CODE_FENCE_RE = /(^|\n) {0,3}(```|~~~)/
 const CODE_FENCE_LANGUAGE_RE = /(^|\n) {0,3}(```+|~~~+)[ \t]*([^\s:,`]*)/g
 
@@ -169,7 +169,7 @@ const ensureLanguages = async (highlighter, languages) => {
   )
 }
 
-const createRenderer = ({ themeName, highlighter }) =>
+export const createMarkdownRenderer = ({ themeName, highlighter }) =>
   new MarkdownIt({
     html: true,
     breaks: true,
@@ -195,18 +195,15 @@ const getRenderer = async (theme, needsHighlight) => {
   if (cached) return cached
 
   const rendererPromise = needsHighlight
-    ? getHighlighter().then((highlighter) => createRenderer({ themeName, highlighter }))
-    : Promise.resolve(createRenderer({ themeName }))
+    ? getHighlighter()
+        .then((highlighter) => createMarkdownRenderer({ themeName, highlighter }))
+        .catch((error) => {
+          console.warn('Markdown code highlighting unavailable, rendering without Shiki:', error)
+          return createMarkdownRenderer({ themeName })
+        })
+    : Promise.resolve(createMarkdownRenderer({ themeName }))
   rendererCache.set(cacheKey, rendererPromise)
   return rendererPromise
-}
-
-const getCachedHtml = (cacheKey) => renderedHtmlCache.get(cacheKey)
-const setCachedHtml = (cacheKey, html) => {
-  if (renderedHtmlCache.size >= MAX_RENDER_CACHE_SIZE) {
-    renderedHtmlCache.delete(renderedHtmlCache.keys().next().value)
-  }
-  renderedHtmlCache.set(cacheKey, html)
 }
 
 export const renderMarkdown = async (content, { theme = 'github-light' } = {}) => {
@@ -219,12 +216,16 @@ export const renderMarkdown = async (content, { theme = 'github-light' } = {}) =
     const themeName = normalizeTheme(theme)
     const needsHighlight = hasCodeFence(svgContent)
     const cacheKey = `${needsHighlight ? themeName : 'plain'}\u0000${svgContent}`
-    const cachedHtml = getCachedHtml(cacheKey)
+    const cachedHtml = renderedHtmlCache.get(cacheKey)
     if (cachedHtml !== undefined) return cachedHtml
 
     if (needsHighlight) {
-      const highlighter = await getHighlighter()
-      await ensureLanguages(highlighter, collectCodeFenceLanguages(svgContent))
+      try {
+        const highlighter = await getHighlighter()
+        await ensureLanguages(highlighter, collectCodeFenceLanguages(svgContent))
+      } catch (error) {
+        console.warn('Markdown languages unavailable, continuing without code highlighting:', error)
+      }
     }
 
     const md = await getRenderer(themeName, needsHighlight)
@@ -243,7 +244,7 @@ export const renderMarkdown = async (content, { theme = 'github-light' } = {}) =
         'rowspan'
       ]
     })
-    setCachedHtml(cacheKey, html)
+    renderedHtmlCache.set(cacheKey, html)
     return html
   } catch (error) {
     console.error('Failed to render markdown:', error)

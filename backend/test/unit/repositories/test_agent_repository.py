@@ -13,6 +13,7 @@ from yuxi.repositories.agent_repository import (
     GENERAL_PURPOSE_AGENT_NAME,
     GENERAL_PURPOSE_AGENT_SLUG,
     SUB_AGENT_BACKEND_ID,
+    merge_agent_config_json,
     user_can_access_agent,
     user_can_manage_agent,
 )
@@ -27,6 +28,129 @@ class FakeDb:
 
     def add(self, item):
         self.added = item
+
+
+_MANAGER_USER_SCOPE = {
+    "version": 2,
+    "read_scope": {"access_level": "user", "user_uids": ["manager"]},
+    "manage_scope": {"access_level": "user", "user_uids": ["manager"]},
+}
+
+
+def _agent_for_update(*, slug="shared-bot", name="Shared Bot", created_by="owner", share_config=_MANAGER_USER_SCOPE):
+    return SimpleNamespace(
+        slug=slug,
+        backend_id="ChatbotAgent",
+        share_config=share_config,
+        created_by=created_by,
+        updated_by=None,
+        updated_at=None,
+        name=name,
+        description="",
+        icon=None,
+        pics=[],
+        config_json={},
+    )
+
+
+def test_merge_agent_config_json_preserves_omitted_context_fields_and_hidden_skills():
+    """省略字段和不可见 Skill 引用均保持原值。"""
+    existing = {
+        "context": {
+            "model": "provider:model-a",
+            "skills": [f"skill-{index}" for index in range(10)],
+        },
+        "metadata": {"source": "owner"},
+    }
+
+    merged = merge_agent_config_json(
+        existing,
+        {
+            "context": {
+                "temperature": 0.2,
+                "skills": [f"skill-{index}" for index in range(5)],
+            }
+        },
+        resource_access={
+            "skills": {
+                *(f"skill-{index}" for index in range(5)),
+                "visible-extra-a",
+                "visible-extra-b",
+                "visible-extra-c",
+            }
+        },
+    )
+
+    assert merged == {
+        "context": {
+            "model": "provider:model-a",
+            "temperature": 0.2,
+            "skills": [f"skill-{index}" for index in range(10)],
+        },
+        "metadata": {"source": "owner"},
+    }
+    assert existing["context"]["skills"] == [f"skill-{index}" for index in range(10)]
+
+
+def test_merge_agent_config_json_applies_visible_edits_and_preserves_hidden_references():
+    """可见增删保留交错引用顺序，新选择追加到末尾。"""
+    merged = merge_agent_config_json(
+        {"context": {"skills": ["visible-a", "hidden-a", "visible-b", "hidden-b"]}},
+        {"context": {"skills": ["visible-b", "visible-c", "hidden-a"]}},
+        resource_access={"skills": {"visible-a", "visible-b", "visible-c"}},
+    )
+
+    assert merged["context"]["skills"] == ["hidden-a", "visible-b", "hidden-b", "visible-c"]
+
+
+@pytest.mark.parametrize("strategy", [None, []])
+def test_merge_agent_config_json_replaces_resource_list_for_explicit_strategy_switch(strategy):
+    """显式空列表或 null 整体切换资源策略。"""
+    merged = merge_agent_config_json(
+        {"context": {"skills": ["visible", "hidden"], "subagents": ["visible-subagent", "hidden-subagent"]}},
+        {"context": {"skills": strategy, "subagents": strategy}},
+        resource_access={"skills": {"visible"}, "subagents": {"visible-subagent"}},
+    )
+
+    assert merged["context"]["skills"] == strategy
+    assert merged["context"]["subagents"] == strategy
+
+
+def test_merge_agent_config_json_rejects_new_unauthorized_resource_reference():
+    """新增无权引用必须拒绝，不能借既有隐藏引用绕过。"""
+    with pytest.raises(ValueError, match="无权新增.*skills.*hidden-new"):
+        merge_agent_config_json(
+            {"context": {"skills": ["visible", "hidden-existing"]}},
+            {"context": {"skills": ["visible", "hidden-existing", "hidden-new"]}},
+            resource_access={"skills": {"visible"}},
+        )
+
+
+def test_merge_agent_config_json_requires_authorization_result_for_resource_write():
+    """缺少权限解析结果的直接资源写入必须拒绝。"""
+    with pytest.raises(ValueError, match="skills 未经过权限校验"):
+        merge_agent_config_json(
+            {"context": {"skills": []}},
+            {"context": {"skills": ["new-skill"]}},
+            resource_access={},
+        )
+
+
+def test_merge_agent_config_json_validates_preload_skills_independently():
+    """预加载选择独立保留不可见引用，不修改 Skill 允许列表。"""
+    merged = merge_agent_config_json(
+        {
+            "context": {
+                "skills": ["visible", "hidden"],
+                "preload_skills": ["visible", "hidden"],
+            }
+        },
+        {"context": {"preload_skills": ["visible"]}},
+        resource_access={"preload_skills": {"visible"}},
+    )
+
+    assert merged["context"]["skills"] == ["visible", "hidden"]
+    assert merged["context"]["preload_skills"] == ["visible", "hidden"]
 
 
 @pytest.mark.asyncio
@@ -190,27 +314,10 @@ def test_user_shared_agent_is_manageable_for_normal_user():
 async def test_delegated_manager_update_preserves_shared_agent_acl():
     db = FakeDb()
     repo = AgentRepository(db)
-    share_config = {
-        "version": 2,
-        "read_scope": {"access_level": "user", "user_uids": ["manager"]},
-        "manage_scope": {"access_level": "user", "user_uids": ["manager"]},
-    }
-    agent = SimpleNamespace(
-        slug="shared-bot",
-        backend_id="ChatbotAgent",
-        share_config=share_config,
-        created_by="owner",
-        updated_by=None,
-        updated_at=None,
-        name="Shared Bot",
-        description="",
-        icon=None,
-        pics=[],
-        config_json={},
-    )
+    agent = _agent_for_update()
     await repo.update(
         agent,
-        share_config=share_config,
+        share_config=_MANAGER_USER_SCOPE,
         updated_by="manager",
     )
 
@@ -222,23 +329,7 @@ async def test_delegated_manager_update_preserves_shared_agent_acl():
 async def test_delegated_manager_can_update_agent_acl_with_standard_validation():
     db = FakeDb()
     repo = AgentRepository(db)
-    agent = SimpleNamespace(
-        slug="shared-bot",
-        backend_id="ChatbotAgent",
-        share_config={
-            "version": 2,
-            "read_scope": {"access_level": "user", "user_uids": ["manager"]},
-            "manage_scope": {"access_level": "user", "user_uids": ["manager"]},
-        },
-        created_by="owner",
-        updated_by=None,
-        updated_at=None,
-        name="Shared Bot",
-        description="",
-        icon=None,
-        pics=[],
-        config_json={},
-    )
+    agent = _agent_for_update()
     await repo.update(
         agent,
         share_config={
@@ -257,23 +348,7 @@ async def test_delegated_manager_can_update_agent_acl_with_standard_validation()
 async def test_normal_user_can_update_read_scope_without_granting_manage_scope():
     db = FakeDb()
     repo = AgentRepository(db)
-    agent = SimpleNamespace(
-        slug="personal-bot",
-        backend_id="ChatbotAgent",
-        share_config={
-            "version": 2,
-            "read_scope": {"access_level": "user", "user_uids": ["manager"]},
-            "manage_scope": {"access_level": "user", "user_uids": ["manager"]},
-        },
-        created_by="manager",
-        updated_by=None,
-        updated_at=None,
-        name="Personal Bot",
-        description="",
-        icon=None,
-        pics=[],
-        config_json={},
-    )
+    agent = _agent_for_update(slug="personal-bot", name="Personal Bot", created_by="manager")
     await repo.update(
         agent,
         share_config={
@@ -299,28 +374,11 @@ async def test_normal_user_can_update_read_scope_without_granting_manage_scope()
 async def test_normal_user_can_update_agent_with_equivalent_v2_share_config():
     db = FakeDb()
     repo = AgentRepository(db)
-    share_config = {
-        "version": 2,
-        "read_scope": {"access_level": "user", "user_uids": ["manager"]},
-        "manage_scope": {"access_level": "user", "user_uids": ["manager"]},
-    }
-    agent = SimpleNamespace(
-        slug="shared-bot",
-        backend_id="ChatbotAgent",
-        share_config=share_config,
-        created_by="manager",
-        updated_by=None,
-        updated_at=None,
-        name="Legacy Bot",
-        description="",
-        icon=None,
-        pics=[],
-        config_json={},
-    )
+    agent = _agent_for_update(name="Legacy Bot", created_by="manager")
     await repo.update(
         agent,
         name="Renamed Bot",
-        share_config=share_config,
+        share_config=_MANAGER_USER_SCOPE,
         updated_by="manager",
     )
 

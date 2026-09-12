@@ -1,17 +1,17 @@
-import { apiDelete, apiGet, apiPost, apiPut } from './base'
+import { apiDelete, apiGet, apiPost, apiPut, buildQuery } from './base'
 
-const buildQuery = (params) => {
-  const query = new URLSearchParams()
-  Object.entries(params).forEach(([key, value]) => {
-    if (value !== undefined && value !== null && value !== '') {
-      query.set(key, String(value))
-    }
+export const getWorkspaceTree = (
+  path = '/',
+  recursive = false,
+  filesOnly = false,
+  includeUnboundProjectDirs = false
+) => {
+  const query = buildQuery({
+    path,
+    recursive,
+    files_only: filesOnly,
+    include_unbound_project_dirs: includeUnboundProjectDirs || undefined
   })
-  return query.toString()
-}
-
-export const getWorkspaceTree = (path = '/', recursive = false, filesOnly = false) => {
-  const query = buildQuery({ path, recursive, files_only: filesOnly })
   return apiGet(`/api/workspace/tree?${query}`)
 }
 
@@ -69,4 +69,8 @@ export const uploadWorkspaceFiles = (parentPath, files) => {
 export const downloadWorkspaceFile = (path) => {
   const query = buildQuery({ path })
   return apiGet(`/api/workspace/download?${query}`, {}, true, 'blob')
+}
+
+export const searchWorkspaceFiles = (query) => {
+  return apiGet(`/api/workspace/search?${buildQuery({ query })}`)
 }

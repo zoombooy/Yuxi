@@ -15,22 +15,49 @@ from PIL import Image
 from rapidocr import EngineType, LangDet, LangRec, ModelType, OCRVersion, RapidOCR
 
 from yuxi.knowledge.parser.base import BaseDocumentProcessor, OCRException
+from yuxi.knowledge.parser.capabilities import get_parser_capability
 from yuxi.utils import logger
+
+_CAPABILITY = get_parser_capability("rapid_ocr")
 
 
 class RapidOCRParser(BaseDocumentProcessor):
     """RapidOCR 解析器 - 使用 ONNX 模型进行文字识别"""
 
-    service_name = "rapid_ocr"
-    display_name = "RapidOCR (ONNX)"
-    supported_extensions = [".pdf", ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"]
+    service_name = _CAPABILITY.service_name
+    display_name = _CAPABILITY.display_name
+    supported_extensions = list(_CAPABILITY.supported_extensions)
 
     def __init__(self, det_box_thresh: float = 0.3):
         self.ocr = None
         self.det_box_thresh = det_box_thresh
 
+    @staticmethod
+    def _resolve_model_dir() -> Path:
+        """获取并确保可写的 RapidOCR 模型存放目录。"""
+        env_dir = os.getenv("RAPIDOCR_MODEL_DIR")
+        if env_dir:
+            model_dir = Path(env_dir).expanduser().resolve()
+            model_dir.mkdir(parents=True, exist_ok=True)
+            return model_dir
+
+        try:
+            import rapidocr
+
+            default_dir = Path(rapidocr.__file__).resolve().parent / "models"
+            if default_dir.exists() and os.access(default_dir, os.W_OK):
+                return default_dir
+        except Exception:
+            pass
+
+        cache_dir = Path.home() / ".cache" / "rapidocr" / "models"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir
+
     def _get_model_params(self) -> dict[str, object]:
+        model_dir = self._resolve_model_dir()
         return {
+            "Global.model_root_dir": str(model_dir),
             "Det.engine_type": EngineType.ONNXRUNTIME,
             "Det.lang_type": LangDet.CH,
             "Det.model_type": ModelType.MOBILE,

@@ -25,12 +25,12 @@
       </div>
     </div>
 
-    <router-view v-else />
+    <router-view v-else :key="route.path" />
   </div>
 </template>
 
 <script setup>
-import { ref, watch, computed } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import ToolsCardList from '@/components/extensions/ToolsCardList.vue'
 import McpCardList from '@/components/extensions/McpCardList.vue'
@@ -48,14 +48,16 @@ const skillsRef = ref(null)
 const mcpRef = ref(null)
 const toolsRef = ref(null)
 
-const adminExtensionTabs = [
+const adminExtensionTabs = computed(() => [
   { key: 'knowledge', label: '知识库' },
   { key: 'skills', label: '技能' },
   { key: 'tools', label: '工具' },
   { key: 'mcp', label: 'MCP' }
-]
+])
 const userExtensionTabs = [{ key: 'skills', label: '技能' }]
-const extensionTabs = computed(() => (userStore.isAdmin ? adminExtensionTabs : userExtensionTabs))
+const extensionTabs = computed(() =>
+  userStore.isAdmin ? adminExtensionTabs.value : userExtensionTabs
+)
 const allowedTabKeys = computed(() => extensionTabs.value.map((tab) => tab.key))
 const defaultTabKey = computed(() => extensionTabs.value[0]?.key || 'skills')
 

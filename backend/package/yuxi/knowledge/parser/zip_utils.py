@@ -1,15 +1,15 @@
 import asyncio
-import hashlib
 import os
 import re
 import time
 import zipfile
 from pathlib import Path
 
+from yuxi.knowledge.utils.kb_utils import build_kb_image_proxy_url
 from yuxi.storage.minio import get_minio_client
 from yuxi.utils import logger
 
-DEFAULT_IMAGE_BUCKET = "public"
+DEFAULT_IMAGE_BUCKET = "kb-images"
 DEFAULT_IMAGE_PREFIX = "unknown/kb-images"
 
 
@@ -22,7 +22,7 @@ async def process_zip_file(
     zip_path: str,
     image_bucket: str = DEFAULT_IMAGE_BUCKET,
     image_prefix: str = DEFAULT_IMAGE_PREFIX,
-) -> dict:
+) -> str:
     """
     处理ZIP文件，提取markdown内容和图片
 
@@ -32,11 +32,7 @@ async def process_zip_file(
         image_prefix: 图片上传对象前缀
 
     Returns:
-        dict: {
-            "markdown_content": str,
-            "content_hash": str,
-            "images_info": list[dict]
-        }
+        str: 处理后的 Markdown 文本。
     """
     with zipfile.ZipFile(zip_path, "r") as zf:
         for name in zf.namelist():
@@ -67,27 +63,21 @@ async def process_zip_file(
             )
             markdown_content = replace_image_links(markdown_content, images_info)
 
-    content_hash = hashlib.sha256(markdown_content.encode("utf-8")).hexdigest()
-
-    return {
-        "markdown_content": markdown_content,
-        "content_hash": content_hash,
-        "images_info": images_info,
-    }
+    return markdown_content
 
 
 def process_zip_file_sync(
     zip_path: str,
     image_bucket: str = DEFAULT_IMAGE_BUCKET,
     image_prefix: str = DEFAULT_IMAGE_PREFIX,
-) -> dict:
+) -> str:
     """同步调用 ZIP 处理，供同步解析器使用。"""
     try:
         asyncio.get_running_loop()
     except RuntimeError:
         return asyncio.run(process_zip_file(zip_path, image_bucket=image_bucket, image_prefix=image_prefix))
 
-    result: dict | None = None
+    result: str | None = None
     error: Exception | None = None
 
     def runner() -> None:
@@ -157,7 +147,7 @@ async def process_images(
             timestamp = int(time.time() * 1000000)
             object_name = f"{normalized_prefix}/{timestamp}_{Path(img_name).name}"
 
-            result = await minio_client.aupload_file(
+            await minio_client.aupload_file(
                 bucket_name=image_bucket,
                 object_name=object_name,
                 data=data,
@@ -165,12 +155,12 @@ async def process_images(
 
             img_info = {
                 "name": Path(img_name).name,
-                "url": result.url,
+                "url": build_kb_image_proxy_url(object_name),
                 "path": f"images/{Path(img_name).name}",
             }
             images.append(img_info)
 
-            logger.debug(f"图片上传成功: {Path(img_name).name} -> {result.url}")
+            logger.debug(f"图片上传成功: {Path(img_name).name} -> {img_info['url']}")
 
         except Exception as e:
             logger.error(f"上传图片失败 {Path(img_name).name}: {e}")

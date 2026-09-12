@@ -16,7 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from test.live_api_cleanup import (  # noqa: E402
-    cleanup_e2e_chat_resources,
+    cleanup_test_chat_resources,
     cleanup_pytest_knowledge_resources,
 )
 
@@ -29,7 +29,6 @@ E2E_PASSWORD = os.getenv("E2E_PASSWORD") or os.getenv("TEST_PASSWORD")
 CLEANUP_USERNAME = E2E_USERNAME or os.getenv("TEST_USERNAME")
 CLEANUP_PASSWORD = E2E_PASSWORD or os.getenv("TEST_PASSWORD")
 E2E_TIMEOUT = httpx.Timeout(300.0, connect=10.0)
-LITE_MODE = os.getenv("LITE_MODE", "").lower() in {"true", "1"}
 
 
 def _require_e2e_credentials() -> tuple[str, str]:
@@ -49,7 +48,7 @@ def e2e_base_url() -> str:
 def cleanup_e2e_test_resources(e2e_base_url: str):
     """在 E2E 会话前后清理测试对话、临时智能体和知识库。"""
 
-    if LITE_MODE or not CLEANUP_USERNAME or not CLEANUP_PASSWORD:
+    if not CLEANUP_USERNAME or not CLEANUP_PASSWORD:
         yield
         return
 
@@ -81,7 +80,7 @@ def cleanup_e2e_test_resources(e2e_base_url: str):
             if not cleanup_uid:
                 raise RuntimeError("E2E cleanup current user payload is missing uid")
 
-            await cleanup_e2e_chat_resources(client, headers, owner_uid=cleanup_uid)
+            await cleanup_test_chat_resources(client, headers, owner_uid=cleanup_uid)
             await cleanup_pytest_knowledge_resources(client, headers)
 
     anyio.run(run_cleanup)

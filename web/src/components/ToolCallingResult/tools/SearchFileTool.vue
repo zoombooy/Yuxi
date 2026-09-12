@@ -2,7 +2,7 @@
   <BaseToolCall :tool-call="toolCall" :hide-params="true">
     <template #header>
       <div class="sep-header">
-        <span class="note">Search File</span>
+        <span class="note">搜索知识库文件</span>
         <span class="separator" v-if="kbNameLabel">|</span>
         <span class="description" v-if="kbNameLabel">知识库: {{ kbNameLabel }}</span>
         <span class="separator" v-if="queryLabel">|</span>
@@ -42,9 +42,10 @@
 
 <script setup>
 import { computed, ref } from 'vue'
-import { FileText } from 'lucide-vue-next'
+import { FileText } from '@lucide/vue'
 import BaseToolCall from '../BaseToolCall.vue'
 import FileDetailModal from '@/components/FileDetailModal.vue'
+import { parseToolCallArgs } from '../toolRegistry'
 
 const props = defineProps({
   toolCall: {
@@ -53,16 +54,7 @@ const props = defineProps({
   }
 })
 
-const args = computed(() => {
-  const value = props.toolCall.args || props.toolCall.function?.arguments
-  if (!value) return {}
-  if (typeof value === 'object') return value
-  try {
-    return JSON.parse(value)
-  } catch {
-    return {}
-  }
-})
+const args = computed(() => parseToolCallArgs(props.toolCall))
 
 const kbNameLabel = computed(() => args.value.kb_name || '')
 const queryLabel = computed(() => args.value.query || '')

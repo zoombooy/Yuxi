@@ -1,15 +1,92 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 import pytest
 
-from yuxi.storage.postgres.manager import PostgresManager
+from yuxi.storage.postgres.manager import (
+    BUSINESS_SCHEMA_VERSION,
+    KNOWLEDGE_SCHEMA_VERSION,
+    BusinessBase,
+    KnowledgeBase,
+    PostgresManager,
+)
+from yuxi.storage.postgres.models_business import AgentRun
+
+
+def test_business_and_knowledge_metadata_are_disjoint():
+    """业务与知识域 metadata 保持独立，迁移器分别创建两个域。"""
+
+    assert BusinessBase is not KnowledgeBase
+    assert "users" in BusinessBase.metadata.tables
+    assert "knowledge_bases" not in BusinessBase.metadata.tables
+    assert "evaluation_runs" not in BusinessBase.metadata.tables
+    assert "knowledge_bases" in KnowledgeBase.metadata.tables
+    assert "evaluation_runs" in KnowledgeBase.metadata.tables
+    assert "users" not in KnowledgeBase.metadata.tables
+
+
+@pytest.mark.asyncio
+async def test_require_current_schema_rejects_missing_or_incompatible_domains(monkeypatch):
+    manager = PostgresManager()
+
+    monkeypatch.setattr(manager, "get_schema_versions", lambda: _async_value({}))
+    with pytest.raises(RuntimeError, match=r"business=missing .*knowledge=missing"):
+        await manager.require_current_schema()
+
+    monkeypatch.setattr(manager, "get_schema_versions", lambda: _async_value({"business": 99}))
+    with pytest.raises(RuntimeError, match=r"business=99"):
+        await manager.require_current_schema()
+
+    monkeypatch.setattr(
+        manager,
+        "get_schema_versions",
+        lambda: _async_value({"business": BUSINESS_SCHEMA_VERSION, "knowledge": KNOWLEDGE_SCHEMA_VERSION}),
+    )
+    await manager.require_current_schema()
+
+
+async def _async_value(value):
+    return value
+
+
+def test_project_uid_foreign_key_has_schema_convergence_name():
+    """ORM fresh schema 必须与后续收敛 SQL 使用同一 FK 名称。"""
+    projects = BusinessBase.metadata.tables["projects"]
+
+    assert [constraint.name for constraint in projects.foreign_key_constraints] == ["fk_projects_uid_users"]
+
+
+def test_project_lifecycle_columns_and_constraint_are_in_fresh_schema():
+    """Fresh schema 与升级收敛必须共享 Project 软删除契约。"""
+    projects = BusinessBase.metadata.tables["projects"]
+
+    assert projects.c.status.nullable is False
+    assert "deleted_at" in projects.c
+    assert "ck_projects_status" in {constraint.name for constraint in projects.constraints}
+
+
+def test_agent_run_serialization_does_not_project_removed_redis_cursor():
+    """AgentRun 序列化不再暴露已删除的 Redis 游标字段。"""
+    run = AgentRun(
+        id="run-1",
+        conversation_thread_id="thread-1",
+        runtime_scope_id="thread-1",
+        agent_slug="main",
+        uid="user-1",
+        request_id="request-1",
+        input_payload={},
+    )
+
+    assert "last_event_id" not in AgentRun.__table__.c
+    assert "last_event_id" not in run.to_dict()
 
 
 class _RecordingConnection:
     def __init__(self):
         self.statements: list[str] = []
 
-    async def execute(self, statement):
+    async def execute(self, statement, params=None):
         self.statements.append(str(statement))
 
 
@@ -32,8 +109,8 @@ class _RecordingEngine:
         return _RecordingBegin(self.connection)
 
 
-@pytest.mark.asyncio
-async def test_ensure_business_schema_backfills_subagent_thread_columns_before_dropping_legacy_columns():
+@asynccontextmanager
+async def _recording_manager():
     manager = PostgresManager()
     original_initialized = manager._initialized
     original_engine = manager.async_engine
@@ -42,10 +119,16 @@ async def test_ensure_business_schema_backfills_subagent_thread_columns_before_d
     manager._initialized = True
     manager.async_engine = _RecordingEngine(connection)
     try:
-        await manager.ensure_business_schema()
+        yield manager, connection
     finally:
         manager._initialized = original_initialized
         manager.async_engine = original_engine
+
+
+@pytest.mark.asyncio
+async def test_ensure_business_schema_backfills_subagent_thread_columns_before_dropping_legacy_columns():
+    async with _recording_manager() as (manager, connection):
+        await manager.ensure_business_schema()
 
     statements = "\n".join(connection.statements)
 
@@ -66,22 +149,29 @@ async def test_ensure_business_schema_backfills_subagent_thread_columns_before_d
     assert statements.index("created_by_parent_run_id") < statements.index(
         "DROP COLUMN IF EXISTS created_by_parent_run_id"
     )
+    assert "ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'active'" in statements
+    assert "ADD COLUMN IF NOT EXISTS deleted_at" in statements
+    assert "ADD CONSTRAINT ck_projects_status" in statements
+
+
+@pytest.mark.asyncio
+async def test_release_upgrade_converges_run_timing_and_removes_cursor():
+    """发布版升级使用同一套完整 DDL，包含全部模型前时间且删除旧游标。"""
+    async with _recording_manager() as (manager, connection):
+        await manager.ensure_business_schema()
+
+    for column in ("prepared_at", "first_output_at", "first_model_request_at"):
+        assert (
+            f"ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS {column} TIMESTAMP WITHOUT TIME ZONE"
+            in connection.statements
+        )
+    assert "ALTER TABLE IF EXISTS agent_runs DROP COLUMN IF EXISTS last_event_id" in connection.statements
 
 
 @pytest.mark.asyncio
 async def test_ensure_business_schema_cleans_duplicate_active_agent_runs_before_unique_index():
-    manager = PostgresManager()
-    original_initialized = manager._initialized
-    original_engine = manager.async_engine
-    connection = _RecordingConnection()
-
-    manager._initialized = True
-    manager.async_engine = _RecordingEngine(connection)
-    try:
+    async with _recording_manager() as (manager, connection):
         await manager.ensure_business_schema()
-    finally:
-        manager._initialized = original_initialized
-        manager.async_engine = original_engine
 
     statements = "\n".join(connection.statements)
 
@@ -94,19 +184,25 @@ async def test_ensure_business_schema_cleans_duplicate_active_agent_runs_before_
 
 
 @pytest.mark.asyncio
-async def test_ensure_business_schema_creates_user_config_table():
-    manager = PostgresManager()
-    original_initialized = manager._initialized
-    original_engine = manager.async_engine
-    connection = _RecordingConnection()
-
-    manager._initialized = True
-    manager.async_engine = _RecordingEngine(connection)
-    try:
+async def test_ensure_business_schema_backfills_unviewed_marker_for_no_run_threads():
+    """没有 chat/resume Run 的历史会话要写入未读哨兵，确保回填探测条件收敛为 false。"""
+    async with _recording_manager() as (manager, connection):
         await manager.ensure_business_schema()
-    finally:
-        manager._initialized = original_initialized
-        manager.async_engine = original_engine
+
+    statements = "\n".join(connection.statements)
+
+    assert "SELECT EXISTS (SELECT 1 FROM conversations WHERE last_viewed_run_id IS NULL)" in statements
+    assert "SET last_viewed_run_id = r.run_id" in statements
+    assert "SET last_viewed_run_id = :marker WHERE last_viewed_run_id IS NULL" in statements
+    assert statements.index("SET last_viewed_run_id = r.run_id") < statements.index(
+        "SET last_viewed_run_id = :marker WHERE last_viewed_run_id IS NULL"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ensure_business_schema_creates_user_config_table():
+    async with _recording_manager() as (manager, connection):
+        await manager.ensure_business_schema()
 
     statements = "\n".join(connection.statements)
 
@@ -116,18 +212,8 @@ async def test_ensure_business_schema_creates_user_config_table():
 
 @pytest.mark.asyncio
 async def test_ensure_business_schema_creates_generic_config_options_table():
-    manager = PostgresManager()
-    original_initialized = manager._initialized
-    original_engine = manager.async_engine
-    connection = _RecordingConnection()
-
-    manager._initialized = True
-    manager.async_engine = _RecordingEngine(connection)
-    try:
+    async with _recording_manager() as (manager, connection):
         await manager.ensure_business_schema()
-    finally:
-        manager._initialized = original_initialized
-        manager.async_engine = original_engine
 
     statements = "\n".join(connection.statements)
 
@@ -139,18 +225,8 @@ async def test_ensure_business_schema_creates_generic_config_options_table():
 
 @pytest.mark.asyncio
 async def test_ensure_business_schema_adds_run_origin_snapshot_columns():
-    manager = PostgresManager()
-    original_initialized = manager._initialized
-    original_engine = manager.async_engine
-    connection = _RecordingConnection()
-
-    manager._initialized = True
-    manager.async_engine = _RecordingEngine(connection)
-    try:
+    async with _recording_manager() as (manager, connection):
         await manager.ensure_business_schema()
-    finally:
-        manager._initialized = original_initialized
-        manager.async_engine = original_engine
 
     statements = "\n".join(connection.statements)
     assert "agent_runs ADD COLUMN IF NOT EXISTS source VARCHAR(32)" in statements
@@ -163,19 +239,34 @@ async def test_ensure_business_schema_adds_run_origin_snapshot_columns():
 
 
 @pytest.mark.asyncio
-async def test_ensure_business_schema_removes_unbound_api_keys_before_requiring_user_id():
-    manager = PostgresManager()
-    original_initialized = manager._initialized
-    original_engine = manager.async_engine
-    connection = _RecordingConnection()
-
-    manager._initialized = True
-    manager.async_engine = _RecordingEngine(connection)
-    try:
+async def test_ensure_business_schema_adds_idempotent_agent_run_lease_columns_and_index():
+    async with _recording_manager() as (manager, connection):
         await manager.ensure_business_schema()
-    finally:
-        manager._initialized = original_initialized
-        manager.async_engine = original_engine
+
+    statements = "\n".join(connection.statements)
+    assert "agent_runs ADD COLUMN IF NOT EXISTS worker_id VARCHAR(128)" in statements
+    assert "agent_runs ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMP WITHOUT TIME ZONE" in statements
+    assert "agent_runs ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMP WITHOUT TIME ZONE" in statements
+    assert "CREATE INDEX IF NOT EXISTS ix_agent_runs_status_lease_expires" in statements
+
+
+@pytest.mark.asyncio
+async def test_ensure_business_schema_adds_nonterminal_run_shape_constraint_without_scanning_history():
+    async with _recording_manager() as (manager, connection):
+        await manager.ensure_business_schema()
+
+    statements = "\n".join(connection.statements)
+    assert "ck_agent_runs_nonterminal_shape" in statements
+    assert "run_type = 'resume'" in statements
+    assert "run_type = 'subagent'" in statements
+    assert "NOT VALID" in statements
+    assert "EXCEPTION WHEN duplicate_object" in statements
+
+
+@pytest.mark.asyncio
+async def test_ensure_business_schema_removes_unbound_api_keys_before_requiring_user_id():
+    async with _recording_manager() as (manager, connection):
+        await manager.ensure_business_schema()
 
     statements = "\n".join(connection.statements)
 
@@ -186,24 +277,27 @@ async def test_ensure_business_schema_removes_unbound_api_keys_before_requiring_
     assert statements.index("DELETE FROM api_keys WHERE user_id IS NULL") < statements.index(
         "ALTER TABLE IF EXISTS api_keys ALTER COLUMN user_id SET NOT NULL"
     )
+    assert "ALTER TABLE IF EXISTS api_keys ADD COLUMN IF NOT EXISTS request_id VARCHAR(64)" in statements
+    assert "ALTER TABLE IF EXISTS api_keys ADD COLUMN IF NOT EXISTS intent_hash VARCHAR(64)" in statements
+    assert (
+        "ALTER TABLE IF EXISTS api_keys ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMP WITHOUT TIME ZONE" in statements
+    )
+    assert "users.is_deleted <> 0" in statements
+    assert "COALESCE(api_key.revoked_at, users.deleted_at, CURRENT_TIMESTAMP)" in statements
+    assert statements.index("ADD COLUMN IF NOT EXISTS revoked_at") < statements.index("users.is_deleted <> 0")
+    assert statements.index("users.is_deleted <> 0") < statements.index(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_api_keys_request_id"
+    )
+    assert "CREATE UNIQUE INDEX IF NOT EXISTS ix_api_keys_request_id" in statements
+    assert "CREATE INDEX IF NOT EXISTS ix_api_keys_revoked_at" in statements
 
 
 @pytest.mark.asyncio
 async def test_share_config_migration_wraps_legacy_scopes_as_read_only():
     """Agent/skill 迁移只把旧 scope 写入 read_scope，manage_scope 置空，避免把历史只读/使用权限追溯升级为 MANAGE。"""
-    manager = PostgresManager()
-    original_initialized = manager._initialized
-    original_engine = manager.async_engine
-    connection = _RecordingConnection()
-
-    manager._initialized = True
-    manager.async_engine = _RecordingEngine(connection)
-    try:
+    async with _recording_manager() as (manager, connection):
         await manager.ensure_business_schema()
         await manager.ensure_knowledge_schema()
-    finally:
-        manager._initialized = original_initialized
-        manager.async_engine = original_engine
 
     statements = "\n".join(connection.statements)
     assert "UPDATE agents SET share_config = jsonb_build_object" in statements
@@ -225,18 +319,8 @@ async def test_share_config_migration_wraps_legacy_scopes_as_read_only():
 
 @pytest.mark.asyncio
 async def test_ensure_knowledge_schema_rebuilds_vectors_for_incomplete_legacy_chunks():
-    manager = PostgresManager()
-    original_initialized = manager._initialized
-    original_engine = manager.async_engine
-    connection = _RecordingConnection()
-
-    manager._initialized = True
-    manager.async_engine = _RecordingEngine(connection)
-    try:
+    async with _recording_manager() as (manager, connection):
         await manager.ensure_knowledge_schema()
-    finally:
-        manager._initialized = original_initialized
-        manager.async_engine = original_engine
 
     statements = "\n".join(connection.statements)
 

@@ -117,6 +117,7 @@ export class ScrollController {
    * @returns {Promise<void>}
    */
   async waitForLayoutStable() {
+    if (typeof requestAnimationFrame !== 'function') return
     // 使用 requestAnimationFrame 确保 DOM 渲染完成
     await new Promise((resolve) => requestAnimationFrame(resolve))
     await new Promise((resolve) => requestAnimationFrame(resolve))
@@ -221,13 +222,6 @@ export class ScrollController {
     this.shouldAutoScroll = true
     this.isProgrammaticScroll = false
   }
-}
-
-/**
- * 创建默认的滚动控制器实例
- */
-export const createScrollController = (containerSelector, options) => {
-  return new ScrollController(containerSelector, options)
 }
 
 export default ScrollController

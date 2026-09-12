@@ -1,5 +1,5 @@
 <template>
-  <div v-if="normalizedToolCalls.length > 0" class="tool-calls-container">
+  <div v-if="displayEntries.length > 0" class="tool-calls-container">
     <button
       v-if="shouldCollapseToolCalls"
       type="button"
@@ -22,17 +22,34 @@
         <span class="summary-status-tag" v-if="statusSummary">{{ statusSummary }}</span>
       </span>
       <span class="summary-trailing">
-        <component :is="areToolCallsExpanded ? ChevronDown : ChevronRight" size="14" />
+        <ChevronDown
+          :size="14"
+          class="summary-chevron"
+          :class="{ 'is-collapsed': !areToolCallsExpanded }"
+        />
       </span>
     </button>
 
-    <div v-if="!shouldCollapseToolCalls || areToolCallsExpanded" class="tool-calls-panel">
-      <div
-        v-for="(toolCall, index) in normalizedToolCalls"
-        :key="toolCall.id || `${getToolCallId(toolCall)}-${index}`"
-        class="tool-call-container"
-      >
-        <ToolCallRenderer :tool-call="toolCall" appearance="timeline" :default-expanded="false" />
+    <div
+      class="tool-calls-collapse-panel"
+      :class="{ 'is-expanded': !shouldCollapseToolCalls || areToolCallsExpanded }"
+    >
+      <div class="tool-calls-collapse-inner">
+        <div class="tool-calls-panel">
+          <div v-for="entry in displayEntries" :key="entry.key" class="tool-call-container">
+            <ReasoningBlockComponent
+              v-if="entry.type === 'reasoning'"
+              :content="entry.content"
+              :is-active="isActive && entry === displayEntries[displayEntries.length - 1]"
+            />
+            <ToolCallRenderer
+              v-else
+              :tool-call="entry.toolCall"
+              appearance="timeline"
+              :default-expanded="false"
+            />
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -40,29 +57,30 @@
 
 <script setup>
 import { computed, ref, watch, inject } from 'vue'
-import { ChevronDown, ChevronRight, Atom } from 'lucide-vue-next'
+import { ChevronDown, Atom } from '@lucide/vue'
+import { storeToRefs } from 'pinia'
+import { useAgentStore } from '@/stores/agent'
+import ReasoningBlockComponent from '@/components/ReasoningBlockComponent.vue'
 import { ToolCallRenderer } from '@/components/ToolCallingResult'
 import {
   getToolCallId,
-  isSubagentToolCall,
+  getToolCallDisplayStatus,
+  getToolName,
+  findToolInList,
   normalizeToolCalls
 } from '@/components/ToolCallingResult/toolRegistry'
 
-const activeSubagentToolCallIds = inject('activeSubagentToolCallIds', null)
+const agentStore = useAgentStore()
+const { availableTools, toolMetadata } = storeToRefs(agentStore)
 
-// task 工具结果不随流式返回，不能用 tool_call_result 判断运行中：只有「活跃」的 task 才算运行中。
-const toolRunState = (toolCall) => {
-  if (toolCall.status === 'error') return 'error'
-  if (toolCall.tool_call_result || toolCall.status === 'success') return 'completed'
-  if (isSubagentToolCall(toolCall)) {
-    if (getToolCallId(toolCall) !== 'task') return 'running'
-    return activeSubagentToolCallIds?.value?.has(String(toolCall.id)) ? 'running' : 'completed'
-  }
-  return 'running'
-}
+const activeSubagentToolCallIds = inject('activeSubagentToolCallIds', null)
 
 const props = defineProps({
   toolCalls: {
+    type: Array,
+    default: () => []
+  },
+  entries: {
     type: Array,
     default: () => []
   },
@@ -74,7 +92,19 @@ const props = defineProps({
 
 const normalizedToolCalls = computed(() => normalizeToolCalls(props.toolCalls))
 
-const shouldCollapseToolCalls = computed(() => normalizedToolCalls.value.length > 0)
+const displayEntries = computed(() =>
+  props.entries.length
+    ? props.entries
+    : normalizedToolCalls.value.map((toolCall, index) => ({
+        type: 'tool',
+        key: toolCall.id || `${getToolCallId(toolCall)}-${index}`,
+        toolCall
+      }))
+)
+const hasReasoning = computed(() =>
+  displayEntries.value.some((entry) => entry.type === 'reasoning')
+)
+const shouldCollapseToolCalls = computed(() => displayEntries.value.length > 0)
 const areToolCallsExpanded = ref(false)
 
 watch(
@@ -100,16 +130,24 @@ watch(
   { immediate: true }
 )
 
+// 工具名称展示优先级：display_label > 完整工具元数据中的 display name > 前端兜底名称映射 > 工具 id
 const getToolCallLabel = (toolCall) => {
   const displayLabel = String(toolCall?.display_label || '').trim()
   if (displayLabel) return displayLabel
 
-  const rawName = getToolCallId(toolCall)
-  const name = typeof rawName === 'string' ? rawName.replaceAll('_', ' ') : 'tool'
-  return name.charAt(0).toUpperCase() + name.slice(1)
+  const toolId = getToolCallId(toolCall)
+  const toolsList = toolMetadata.value.length
+    ? toolMetadata.value
+    : availableTools.value
+      ? Object.values(availableTools.value)
+      : []
+  const tool = findToolInList(toolId, toolsList)
+  return tool ? tool.name : getToolName(toolId)
 }
 
 const toolCallsSummaryTitle = computed(() => {
+  if (normalizedToolCalls.value.length === 0) return props.isActive ? 'Thinking...' : '推理过程'
+  if (hasReasoning.value) return `推理与工具调用 · ${normalizedToolCalls.value.length} 个工具`
   if (normalizedToolCalls.value.length === 1) {
     return `调用: ${getToolCallLabel(normalizedToolCalls.value[0])}`
   }
@@ -127,15 +165,13 @@ const toolCallsNamesMeta = computed(() => {
 })
 
 const statusSummary = computed(() => {
-  const states = normalizedToolCalls.value.map(toolRunState)
-  const successCount = states.filter((state) => state === 'completed').length
+  const states = normalizedToolCalls.value.map((toolCall) =>
+    getToolCallDisplayStatus(toolCall, activeSubagentToolCallIds?.value)
+  )
   const runningCount = states.filter((state) => state === 'running').length
   const errorCount = states.filter((state) => state === 'error').length
 
   const parts = []
-  if (successCount > 0 && successCount === normalizedToolCalls.value.length) {
-    return '已完成'
-  }
   if (errorCount > 0) parts.push(`${errorCount} 失败`)
   if (runningCount > 0) parts.push(`${runningCount} 进行中`)
 
@@ -152,6 +188,8 @@ const toggleToolCallsExpanded = () => {
 .tool-calls-container {
   width: 100%;
   padding: 0;
+  display: flex;
+  flex-direction: column;
 
   .tool-calls-summary {
     appearance: none;
@@ -166,17 +204,25 @@ const toggleToolCallsExpanded = () => {
     outline: none;
     border: none;
     padding: 0;
-    transition: all 0.2s ease;
+    transition: color 0.15s ease;
     user-select: none;
     background: transparent;
 
+    &:focus-visible {
+      outline: 2px solid var(--main-300);
+      outline-offset: 2px;
+    }
+
     &:hover {
       color: var(--gray-800);
+
+      .summary-chevron {
+        color: var(--gray-700);
+      }
     }
 
     &.is-expanded {
       color: var(--gray-800);
-      margin-bottom: 4px;
     }
 
     .summary-leading {
@@ -215,8 +261,7 @@ const toggleToolCallsExpanded = () => {
     .summary-status-tag {
       margin-left: 4px;
       font-size: 11px;
-      padding: 0px 4px;
-      // background: var(--gray-25);
+      padding: 0 4px;
       color: var(--gray-600);
       border-radius: 4px;
       white-space: nowrap;
@@ -229,12 +274,54 @@ const toggleToolCallsExpanded = () => {
       color: var(--gray-500);
       flex-shrink: 0;
     }
+
+    .summary-chevron {
+      flex-shrink: 0;
+      color: var(--gray-400);
+      transition:
+        transform 0.22s cubic-bezier(0.16, 1, 0.3, 1),
+        color 0.18s ease;
+
+      &.is-collapsed {
+        transform: rotate(-90deg);
+      }
+    }
+  }
+
+  .tool-calls-collapse-panel {
+    display: grid;
+    grid-template-rows: 0fr;
+    transition:
+      grid-template-rows 0.24s cubic-bezier(0.16, 1, 0.3, 1),
+      visibility 0.24s ease;
+    visibility: hidden;
+    min-width: 0;
+
+    &.is-expanded {
+      grid-template-rows: 1fr;
+      visibility: visible;
+    }
+  }
+
+  .tool-calls-collapse-inner {
+    overflow: hidden;
+    min-height: 0;
+    opacity: 0;
+    transform: translateY(-4px);
+    transition:
+      opacity 0.2s ease,
+      transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  .tool-calls-collapse-panel.is-expanded .tool-calls-collapse-inner {
+    opacity: 1;
+    transform: translateY(0);
   }
 
   .tool-calls-panel {
     border-top: 1px solid var(--gray-100);
-    padding-top: 4px;
-    margin-top: 4px;
+    padding-top: 6px;
+    margin-top: 6px;
     margin-bottom: 8px;
   }
 
@@ -242,6 +329,16 @@ const toggleToolCallsExpanded = () => {
     margin-bottom: 4px;
     &:last-child {
       margin-bottom: 0;
+    }
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tool-calls-container {
+    .tool-calls-summary .summary-chevron,
+    .tool-calls-collapse-panel,
+    .tool-calls-collapse-inner {
+      transition: none;
     }
   }
 }

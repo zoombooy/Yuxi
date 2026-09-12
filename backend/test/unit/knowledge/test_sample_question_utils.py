@@ -24,6 +24,14 @@ def _database_detail(files: dict | None = None, *, name: str = "测试知识库"
     )
 
 
+class FakeKnowledgeBase:
+    def __init__(self, detail: KnowledgeBaseDetail):
+        self.detail = detail
+
+    async def get_database_info(self, kb_id: str, include_files: bool = False) -> KnowledgeBaseDetail:
+        return self.detail
+
+
 def test_parse_sample_questions_content_strips_json_fence():
     questions = sq.parse_sample_questions_content('```json\n{"questions": ["什么是测试？"]}\n```')
 
@@ -37,11 +45,7 @@ def test_parse_sample_questions_content_rejects_invalid_payload():
 
 @pytest.mark.asyncio
 async def test_generate_database_sample_questions_rejects_empty_files(monkeypatch):
-    class FakeKnowledgeBase:
-        async def get_database_info(self, kb_id: str, include_files: bool = False) -> KnowledgeBaseDetail:
-            return _database_detail({}, name="空知识库")
-
-    monkeypatch.setattr(sq, "knowledge_base", FakeKnowledgeBase())
+    monkeypatch.setattr(sq, "knowledge_base", FakeKnowledgeBase(_database_detail({}, name="空知识库")))
     monkeypatch.setattr(
         sq.KnowledgeBaseFactory,
         "get_kb_class",
@@ -59,10 +63,6 @@ async def test_generate_database_sample_questions_rejects_empty_files(monkeypatc
 async def test_generate_database_sample_questions_saves_and_returns_questions(monkeypatch):
     saved: dict = {}
 
-    class FakeKnowledgeBase:
-        async def get_database_info(self, kb_id: str, include_files: bool = False) -> KnowledgeBaseDetail:
-            return _database_detail({"file_1": {"filename": "demo.md", "file_type": "md"}})
-
     class FakeModel:
         async def call(self, messages, stream: bool = False):
             assert messages[0]["role"] == "system"
@@ -76,7 +76,11 @@ async def test_generate_database_sample_questions_saves_and_returns_questions(mo
         async def get_by_kb_id(self, kb_id: str):
             return SimpleNamespace(name="测试知识库", sample_questions=saved.get(kb_id))
 
-    monkeypatch.setattr(sq, "knowledge_base", FakeKnowledgeBase())
+    monkeypatch.setattr(
+        sq,
+        "knowledge_base",
+        FakeKnowledgeBase(_database_detail({"file_1": {"filename": "demo.md", "file_type": "md"}})),
+    )
     monkeypatch.setattr(
         sq.KnowledgeBaseFactory,
         "get_kb_class",
@@ -84,6 +88,11 @@ async def test_generate_database_sample_questions_saves_and_returns_questions(mo
     )
     monkeypatch.setattr(sq, "select_model", lambda model_spec: FakeModel())
     monkeypatch.setattr(sq, "KnowledgeBaseRepository", lambda: FakeRepository())
+
+    async def get_system_options(_option, _db=None):
+        return {"default_model": "test-provider:test-model"}
+
+    monkeypatch.setattr(type(sq.system_options), "get", get_system_options)
 
     generated = await sq.generate_database_sample_questions("kb_1", count=1)
     stored = await sq.get_database_sample_questions("kb_1")
@@ -95,21 +104,26 @@ async def test_generate_database_sample_questions_saves_and_returns_questions(mo
 
 @pytest.mark.asyncio
 async def test_generate_database_sample_questions_maps_invalid_json(monkeypatch):
-    class FakeKnowledgeBase:
-        async def get_database_info(self, kb_id: str, include_files: bool = False) -> KnowledgeBaseDetail:
-            return _database_detail({"file_1": {"filename": "demo.md", "file_type": "md"}})
-
     class FakeModel:
         async def call(self, messages, stream: bool = False):
             return SimpleNamespace(content="not json")
 
-    monkeypatch.setattr(sq, "knowledge_base", FakeKnowledgeBase())
+    monkeypatch.setattr(
+        sq,
+        "knowledge_base",
+        FakeKnowledgeBase(_database_detail({"file_1": {"filename": "demo.md", "file_type": "md"}})),
+    )
     monkeypatch.setattr(
         sq.KnowledgeBaseFactory,
         "get_kb_class",
         lambda _kb_type: SimpleNamespace(supports_documents=True),
     )
     monkeypatch.setattr(sq, "select_model", lambda model_spec: FakeModel())
+
+    async def get_system_options(_option, _db=None):
+        return {"default_model": "test-provider:test-model"}
+
+    monkeypatch.setattr(type(sq.system_options), "get", get_system_options)
 
     with pytest.raises(HTTPException) as exc_info:
         await sq.generate_database_sample_questions("kb_1")

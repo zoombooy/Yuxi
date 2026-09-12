@@ -44,8 +44,10 @@ class ReadOnlyConnectors(KnowledgeBase):
         operator_id: str | None = None,
         *,
         additional_params: dict[str, Any],
+        processing_task_id: str | None = None,
+        processing_owner: str | None = None,
     ) -> dict:
-        del kb_id, file_id, operator_id, additional_params
+        del kb_id, file_id, operator_id, additional_params, processing_task_id, processing_owner
         raise self._readonly_error()
 
     async def update_file_params(
@@ -60,10 +62,19 @@ class ReadOnlyConnectors(KnowledgeBase):
         del kb_id, file_id, params, operator_id, additional_params
         raise self._readonly_error()
 
-    async def create_folder(self, kb_id: str, folder_name: str, parent_id: str | None = None) -> dict:
+    async def create_folder(
+        self,
+        kb_id: str,
+        folder_name: str,
+        parent_id: str | None = None,
+        operator_id: str | None = None,
+    ) -> dict:
         raise self._readonly_error()
 
     async def move_file(self, kb_id: str, file_id: str, new_parent_id: str | None) -> dict:
+        raise self._readonly_error()
+
+    async def rename_folder(self, kb_id: str, folder_id: str, folder_name: str) -> dict:
         raise self._readonly_error()
 
     async def delete_folder(self, kb_id: str, folder_id: str) -> None:
@@ -78,20 +89,19 @@ class ReadOnlyConnectors(KnowledgeBase):
         *,
         embedding_model_spec: str | None,
         additional_params: dict[str, Any],
+        processing_task_id: str | None = None,
+        processing_owner: str | None = None,
     ) -> dict:
-        del kb_id, file_id, operator_id, params, embedding_model_spec, additional_params
-        raise self._readonly_error()
-
-    async def update_content(
-        self,
-        kb_id: str,
-        file_ids: list[str],
-        params: dict | None = None,
-        *,
-        embedding_model_spec: str | None,
-        additional_params: dict[str, Any],
-    ) -> list[dict]:
-        del kb_id, file_ids, params, embedding_model_spec, additional_params
+        del (
+            kb_id,
+            file_id,
+            operator_id,
+            params,
+            embedding_model_spec,
+            additional_params,
+            processing_task_id,
+            processing_owner,
+        )
         raise self._readonly_error()
 
     async def delete_file(self, kb_id: str, file_id: str) -> None:
@@ -133,10 +143,6 @@ class ReadOnlyConnectors(KnowledgeBase):
     ) -> dict:
         del kb_id, parent_id, recursive, files_only
         raise ValueError("只读检索连接器不支持文件树预览")
-
-    async def read_file_preview(self, kb_id: str, file_id: str) -> dict:
-        del kb_id, file_id
-        raise ValueError("只读检索连接器不支持文件预览")
 
     async def get_file_download(self, kb_id: str, file_id: str, variant: str = "original") -> dict:
         del kb_id, file_id, variant

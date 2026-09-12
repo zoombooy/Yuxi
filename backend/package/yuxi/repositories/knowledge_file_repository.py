@@ -1,21 +1,176 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+import json
+import uuid
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import DateTime, String, case, cast, func, literal, or_, select, union_all, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from yuxi.storage.postgres.manager import pg_manager
+from yuxi.storage.postgres.models_business import TaskRecord
 from yuxi.storage.postgres.models_knowledge import KnowledgeFile
-from yuxi.utils.datetime_utils import utc_now_naive
+from yuxi.utils import logger
+from yuxi.utils.datetime_utils import utc_now
 
 # asyncpg 单条 SQL 参数上限为 32767；按 file_id 批量查询时统一分批，避免
 # mindmap_file_ids 等大尺寸传入触发 `too many parameters` 报错。
 SQL_IN_BATCH_SIZE = 10_000
 
+# 文件统计聚合缓存 TTL：列表页高频请求时避免反复全表聚合；文件增删后最多延迟该时长更新
+KB_FILE_STATS_CACHE_TTL = 10
+
 
 class KnowledgeFileRepository:
+    @asynccontextmanager
+    async def lock_file_tree(self, kb_id: str) -> AsyncIterator[None]:
+        """按知识库串行化目录树结构修改。"""
+        async with pg_manager.get_async_session_context() as session:
+            await session.execute(select(func.pg_advisory_xact_lock(func.hashtext(kb_id))))
+            yield
+
+    async def detect_virtual_folder_data(self, kb_id: str) -> dict[str, int | bool]:
+        """检测仍以相对路径保存的历史文件记录。"""
+        path_record = KnowledgeFile.filename.contains("/")
+        async with pg_manager.get_async_session_context() as session:
+            result = await session.execute(
+                select(
+                    func.count(KnowledgeFile.file_id),
+                    func.coalesce(
+                        func.sum(
+                            func.length(KnowledgeFile.filename)
+                            - func.length(func.replace(KnowledgeFile.filename, "/", ""))
+                        ),
+                        0,
+                    ),
+                ).where(
+                    KnowledgeFile.kb_id == kb_id,
+                    or_(KnowledgeFile.is_folder.is_(False), KnowledgeFile.is_folder.is_(None)),
+                    path_record,
+                )
+            )
+            file_count, remaining_steps = result.one()
+        count = int(file_count or 0)
+        return {
+            "has_virtual_folders": count > 0,
+            "file_count": count,
+            "remaining_steps": int(remaining_steps or 0),
+        }
+
+    async def migrate_virtual_folder_batch(
+        self,
+        session,
+        *,
+        kb_id: str,
+        operator_id: str,
+        after_file_id: str | None,
+        batch_size: int = 500,
+    ) -> dict[str, Any]:
+        """在调用方拥有的 Task attempt 事务内迁移一批路径。"""
+        filters = [
+            KnowledgeFile.kb_id == kb_id,
+            or_(KnowledgeFile.is_folder.is_(False), KnowledgeFile.is_folder.is_(None)),
+            KnowledgeFile.filename.contains("/"),
+        ]
+        if after_file_id:
+            filters.append(KnowledgeFile.file_id > after_file_id)
+
+        await session.execute(select(func.pg_advisory_xact_lock(func.hashtext(kb_id))))
+        records = list(
+            (
+                await session.execute(
+                    select(KnowledgeFile).where(*filters).order_by(KnowledgeFile.file_id).limit(batch_size)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not records:
+            return {"scanned": 0, "processed": 0, "created_folders": 0, "conflict_file_ids": []}
+
+        groups: dict[tuple[str | None, str], list[KnowledgeFile]] = {}
+        conflict_file_ids: list[str] = []
+        for record in records:
+            segment, remainder = record.filename.split("/", 1)
+            if not segment or segment in {".", ".."} or not remainder:
+                conflict_file_ids.append(record.file_id)
+                continue
+            groups.setdefault((record.parent_id, segment), []).append(record)
+
+        processed = 0
+        created_folders = 0
+        for (parent_id, segment), group in groups.items():
+            siblings = list(
+                (
+                    await session.execute(
+                        select(KnowledgeFile).where(
+                            KnowledgeFile.kb_id == kb_id,
+                            self._parent_condition(parent_id),
+                            KnowledgeFile.filename == segment,
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if len(siblings) == 1 and siblings[0].is_folder:
+                folder = siblings[0]
+            elif siblings:
+                conflict_file_ids.extend(record.file_id for record in group)
+                continue
+            else:
+                folder = KnowledgeFile(
+                    file_id=f"folder-{uuid.uuid4()}",
+                    kb_id=kb_id,
+                    parent_id=parent_id,
+                    filename=segment,
+                    path=segment,
+                    file_type="folder",
+                    status="done",
+                    is_folder=True,
+                    file_size=0,
+                    chunk_count=0,
+                    token_count=0,
+                    created_by=operator_id,
+                )
+                session.add(folder)
+                await session.flush()
+                created_folders += 1
+
+            for record in group:
+                record.parent_id = folder.file_id
+                record.filename = record.filename.split("/", 1)[1]
+                processed += 1
+
+        return {
+            "scanned": len(records),
+            "processed": processed,
+            "created_folders": created_folders,
+            "conflict_file_ids": conflict_file_ids,
+            "last_file_id": records[-1].file_id,
+        }
+
+    async def aggregate_dashboard_stats(self) -> list[tuple[str, int, int, int]]:
+        """按文件类型聚合真实文件数、大小与 Chunk 数。"""
+        async with pg_manager.get_async_session_context() as session:
+            result = await session.execute(
+                select(
+                    KnowledgeFile.file_type,
+                    func.count(KnowledgeFile.file_id),
+                    func.coalesce(func.sum(KnowledgeFile.file_size), 0),
+                    func.coalesce(func.sum(KnowledgeFile.chunk_count), 0),
+                )
+                .where(or_(KnowledgeFile.is_folder.is_(False), KnowledgeFile.is_folder.is_(None)))
+                .group_by(KnowledgeFile.file_type)
+            )
+            return [
+                (str(file_type or "unknown"), int(count or 0), int(size or 0), int(nodes or 0))
+                for file_type, count, size, nodes in result.all()
+            ]
+
     _writable_fields = {
         "kb_id",
         "parent_id",
@@ -34,6 +189,8 @@ class KnowledgeFileRepository:
         "processing_params",
         "is_folder",
         "error_message",
+        "processing_task_id",
+        "processing_owner",
         "created_by",
         "updated_by",
     }
@@ -47,7 +204,7 @@ class KnowledgeFileRepository:
     def _sanitize_data(cls, data: dict[str, Any]) -> dict[str, Any]:
         sanitized = {key: value for key, value in data.items() if key in cls._writable_fields}
         if sanitized:
-            sanitized["updated_at"] = utc_now_naive()
+            sanitized["updated_at"] = utc_now()
         return sanitized
 
     async def get_all(self) -> list[KnowledgeFile]:
@@ -346,8 +503,10 @@ class KnowledgeFileRepository:
         base_filters = [KnowledgeFile.kb_id == kb_id, parent_condition, KnowledgeFile.filename.is_not(None)]
         if path_prefix:
             base_filters.append(KnowledgeFile.filename.like(self._like_prefix(path_prefix), escape="\\"))
-
-        remainder = func.substr(KnowledgeFile.filename, len(path_prefix) + 1)
+            remainder = func.substr(KnowledgeFile.filename, len(path_prefix) + 1)
+        else:
+            # 根目录直接使用 filename 表达式，匹配部分索引 idx_kf_kb_parent_segment/idx_kf_kb_parent_flat
+            remainder = KnowledgeFile.filename
         immediate_name = remainder.label("filename")
         segment = func.split_part(remainder, "/", 1)
         virtual_path_prefix = (literal(path_prefix) + segment + literal("/")).label("path_prefix")
@@ -491,40 +650,55 @@ class KnowledgeFileRepository:
             return {str(parent_id): int(count or 0) for parent_id, count in result.all() if parent_id}
 
     async def get_kb_file_stats(self, kb_id: str) -> dict[str, int]:
-        non_folder = KnowledgeFile.is_folder.is_(False)
+        """获取知识库文件统计；结果带短 TTL 缓存，避免高频列表请求反复全表聚合。"""
+        from yuxi.storage.redis import get_async_redis_client
+
+        cache_key = f"yuxi:kb_file_stats:{kb_id}"
+        redis_client = await get_async_redis_client()
+        try:
+            cached = await redis_client.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except Exception as exc:
+            logger.warning(f"Failed to load kb file stats cache {cache_key}: {exc}")
+
         async with pg_manager.get_async_session_context() as session:
-            result = await session.execute(
-                select(
-                    func.count(KnowledgeFile.file_id).label("row_count"),
-                    func.sum(case((non_folder, 1), else_=0)).label("file_count"),
-                    func.sum(case((KnowledgeFile.is_folder.is_(True), 1), else_=0)).label("folder_count"),
-                    func.coalesce(func.sum(case((non_folder, KnowledgeFile.file_size), else_=0)), 0).label(
-                        "total_size"
-                    ),
-                    func.coalesce(func.sum(case((non_folder, KnowledgeFile.chunk_count), else_=0)), 0).label(
-                        "chunk_count"
-                    ),
-                    func.coalesce(func.sum(case((non_folder, KnowledgeFile.token_count), else_=0)), 0).label(
-                        "token_count"
-                    ),
-                    func.sum(case((non_folder & (KnowledgeFile.status == "uploaded"), 1), else_=0)).label(
-                        "pending_parse_count"
-                    ),
-                    func.sum(
-                        case((non_folder & KnowledgeFile.status.in_(["parsed", "error_indexing"]), 1), else_=0)
-                    ).label("pending_index_count"),
-                    func.sum(
-                        case(
-                            (
-                                non_folder & KnowledgeFile.status.in_(["processing", "waiting", "parsing", "indexing"]),
-                                1,
-                            ),
-                            else_=0,
-                        )
-                    ).label("processing_count"),
-                ).where(KnowledgeFile.kb_id == kb_id)
-            )
-            row = result.one()
+            stats = await self.query_kb_file_stats(kb_id, session=session)
+        try:
+            await redis_client.set(cache_key, json.dumps(stats), ex=KB_FILE_STATS_CACHE_TTL)
+        except Exception as exc:
+            logger.warning(f"Failed to store kb file stats cache {cache_key}: {exc}")
+        return stats
+
+    async def query_kb_file_stats(self, kb_id: str, *, session: AsyncSession) -> dict[str, int]:
+        """在调用方事务中直接聚合文件统计，绕过读取缓存。"""
+        non_folder = KnowledgeFile.is_folder.is_(False)
+        result = await session.execute(
+            select(
+                func.count(KnowledgeFile.file_id).label("row_count"),
+                func.sum(case((non_folder, 1), else_=0)).label("file_count"),
+                func.sum(case((KnowledgeFile.is_folder.is_(True), 1), else_=0)).label("folder_count"),
+                func.coalesce(func.sum(case((non_folder, KnowledgeFile.file_size), else_=0)), 0).label("total_size"),
+                func.coalesce(func.sum(case((non_folder, KnowledgeFile.chunk_count), else_=0)), 0).label("chunk_count"),
+                func.coalesce(func.sum(case((non_folder, KnowledgeFile.token_count), else_=0)), 0).label("token_count"),
+                func.sum(case((non_folder & (KnowledgeFile.status == "uploaded"), 1), else_=0)).label(
+                    "pending_parse_count"
+                ),
+                func.sum(case((non_folder & KnowledgeFile.status.in_(["parsed", "error_indexing"]), 1), else_=0)).label(
+                    "pending_index_count"
+                ),
+                func.sum(
+                    case(
+                        (
+                            non_folder & KnowledgeFile.status.in_(["processing", "waiting", "parsing", "indexing"]),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ).label("processing_count"),
+            ).where(KnowledgeFile.kb_id == kb_id)
+        )
+        row = result.one()
 
         return {
             "row_count": int(row.row_count or 0),
@@ -582,23 +756,74 @@ class KnowledgeFileRepository:
         file_id: str,
         allowed_statuses: set[str],
         data: dict[str, Any],
+        processing_task_id: str | None = None,
+        processing_owner: str | None = None,
     ) -> KnowledgeFile | None:
+        lease_task_id = processing_task_id or data.get("processing_task_id")
+        lease_owner = processing_owner or data.get("processing_owner")
         sanitized_data = self._sanitize_data(data)
         if not sanitized_data:
             return await self.get_by_file_id(file_id)
 
+        filters = [
+            KnowledgeFile.kb_id == kb_id,
+            KnowledgeFile.file_id == file_id,
+            KnowledgeFile.status.in_(sorted(allowed_statuses)),
+        ]
+        if processing_task_id is not None:
+            filters.append(KnowledgeFile.processing_task_id == processing_task_id)
+        if processing_owner is not None:
+            filters.append(KnowledgeFile.processing_owner == processing_owner)
         async with pg_manager.get_async_session_context() as session:
-            result = await session.execute(
-                update(KnowledgeFile)
-                .where(
-                    KnowledgeFile.kb_id == kb_id,
-                    KnowledgeFile.file_id == file_id,
-                    KnowledgeFile.status.in_(sorted(allowed_statuses)),
+            if lease_task_id is not None and lease_owner is not None:
+                task_record = await session.scalar(
+                    select(TaskRecord)
+                    .where(
+                        TaskRecord.id == lease_task_id,
+                        TaskRecord.status == "running",
+                        TaskRecord.worker_id == lease_owner,
+                    )
+                    .with_for_update()
                 )
-                .values(**sanitized_data)
-                .returning(KnowledgeFile)
+                if task_record is None:
+                    return None
+                file_record = await session.scalar(select(KnowledgeFile).where(*filters).with_for_update())
+                if file_record is None:
+                    return None
+                database_now = await session.scalar(select(func.timezone("utc", func.clock_timestamp())))
+                if task_record.lease_expires_at is None or task_record.lease_expires_at <= database_now:
+                    return None
+                for key, value in sanitized_data.items():
+                    setattr(file_record, key, value)
+                await session.flush()
+                return file_record
+
+            result = await session.execute(
+                update(KnowledgeFile).where(*filters).values(**sanitized_data).returning(KnowledgeFile)
             )
             return result.scalar_one_or_none()
+
+    @staticmethod
+    async def fail_task_processing_in_session(session, *, task_id: str, error: str) -> int:
+        """仅收敛仍由指定 Durable Task 拥有的文件中间态。"""
+        result = await session.execute(
+            update(KnowledgeFile)
+            .where(
+                KnowledgeFile.processing_task_id == task_id,
+                KnowledgeFile.status.in_(["parsing", "indexing"]),
+            )
+            .values(
+                status=case(
+                    (KnowledgeFile.status == "parsing", "error_parsing"),
+                    else_="error_indexing",
+                ),
+                error_message=error,
+                processing_task_id=None,
+                processing_owner=None,
+                updated_at=func.now(),
+            )
+        )
+        return int(result.rowcount or 0)
 
     async def delete(self, file_id: str) -> None:
         async with pg_manager.get_async_session_context() as session:

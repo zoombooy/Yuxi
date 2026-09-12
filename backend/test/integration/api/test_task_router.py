@@ -5,14 +5,11 @@ Integration tests for the task management router.
 from __future__ import annotations
 
 import asyncio
-import os
 import uuid
 
 import pytest
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
-
-_LITE_MODE = os.getenv("LITE_MODE", "").lower() in {"true", "1"}
 
 
 async def test_task_routes_require_admin(test_client, standard_user):
@@ -52,15 +49,6 @@ async def test_enqueue_document_creates_task(
     admin_headers,
 ):
     """Trigger knowledge ingestion to ensure a task record is materialised."""
-    if _LITE_MODE:
-        enqueue_response = await test_client.post(
-            "/api/knowledge/databases/lite-mode-disabled/documents",
-            json={"items": [], "params": {"content_type": "file"}},
-            headers=admin_headers,
-        )
-        assert enqueue_response.status_code == 404
-        return
-
     create_response = await test_client.post(
         "/api/knowledge/databases",
         json={
@@ -76,11 +64,31 @@ async def test_enqueue_document_creates_task(
     kb_id = create_response.json()["kb_id"]
 
     try:
+        upload_response = await test_client.post(
+            "/api/knowledge/files/upload",
+            params={"kb_id": kb_id},
+            files={
+                "file": (
+                    f"pytest_task_{uuid.uuid4().hex[:8]}.txt",
+                    b"task router integration test",
+                    "text/plain",
+                )
+            },
+            headers=admin_headers,
+        )
+        assert upload_response.status_code == 200, upload_response.text
+        upload_payload = upload_response.json()
+        file_path = upload_payload["file_path"]
+
         enqueue_response = await test_client.post(
             f"/api/knowledge/databases/{kb_id}/documents",
             json={
-                "items": [],
-                "params": {"content_type": "file"},
+                "items": [file_path],
+                "params": {
+                    "content_type": "file",
+                    "content_hashes": {file_path: upload_payload["content_hash"]},
+                    "file_sizes": {file_path: upload_payload["size"]},
+                },
             },
             headers=admin_headers,
         )
@@ -109,14 +117,35 @@ async def test_enqueue_document_creates_task(
         else:
             pytest.fail("Task did not appear in list endpoint within timeout window")
 
-        # Poll for terminal state to validate worker bookkeeping.
-        for _ in range(20):
+        # Poll for successful worker completion, then independently read the persisted file result.
+        detail_payload = {}
+        for _ in range(120):
             detail_response = await test_client.get(f"/api/tasks/{task_id}", headers=admin_headers)
-            task_status = detail_response.json().get("task", {}).get("status")
+            assert detail_response.status_code == 200, detail_response.text
+            detail_payload = detail_response.json().get("task", {})
+            task_status = detail_payload.get("status")
             if task_status in {"success", "failed", "cancelled"}:
                 break
             await asyncio.sleep(0.5)
         else:
             pytest.fail("Task did not reach a terminal status within timeout window")
+
+        assert task_status == "success", detail_payload
+        result = detail_payload.get("result") or {}
+        assert result.get("failed") == 0, result
+        assert len(result.get("items") or []) == 1, result
+        file_id = result["items"][0].get("file_id")
+        assert file_id, result
+
+        file_response = await test_client.get(
+            f"/api/knowledge/databases/{kb_id}/documents/{file_id}/basic",
+            headers=admin_headers,
+        )
+        assert file_response.status_code == 200, file_response.text
+        file_payload = file_response.json()
+        file_meta = file_payload.get("meta") or file_payload
+        assert file_meta.get("file_id") == file_id
+        assert file_meta.get("status") == "parsed", file_payload
+        assert file_meta.get("markdown_file"), file_payload
     finally:
         await test_client.delete(f"/api/knowledge/databases/{kb_id}", headers=admin_headers)

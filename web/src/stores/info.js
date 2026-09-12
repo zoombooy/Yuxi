@@ -2,12 +2,22 @@ import { ref, computed } from 'vue'
 import { defineStore } from 'pinia'
 import { brandApi } from '@/apis/system_api'
 
+function readDebugMode() {
+  try {
+    return localStorage.getItem('yuxi_debug_mode') === 'true'
+  } catch {
+    return false
+  }
+}
+
 export const useInfoStore = defineStore('info', () => {
   // 状态
   const infoConfig = ref({})
   const isLoading = ref(false)
   const isLoaded = ref(false)
-  const debugMode = ref(false)
+  let pendingInfoRequest = null
+  const debugMode = ref(readDebugMode())
+  const showDebugModal = ref(false)
 
   // 计算属性 - 组织信息
   const organization = computed(
@@ -44,16 +54,48 @@ export const useInfoStore = defineStore('info', () => {
     isLoaded.value = true
   }
 
+  function setDebugMode(enabled) {
+    debugMode.value = Boolean(enabled)
+    try {
+      if (debugMode.value) {
+        localStorage.setItem('yuxi_debug_mode', 'true')
+      } else {
+        localStorage.removeItem('yuxi_debug_mode')
+      }
+    } catch {
+      // localStorage 不可用时仍保留当前页面内的响应式状态。
+    }
+  }
+
   function toggleDebugMode() {
-    debugMode.value = !debugMode.value
+    setDebugMode(!debugMode.value)
+  }
+
+  function openDebugModal() {
+    showDebugModal.value = true
+  }
+
+  function closeDebugModal() {
+    showDebugModal.value = false
   }
 
   async function loadInfoConfig(force = false) {
+    if (pendingInfoRequest) return pendingInfoRequest
     // 如果已经加载过且不强制刷新，则不重新加载
     if (isLoaded.value && !force) {
       return infoConfig.value
     }
 
+    try {
+      pendingInfoRequest = fetchInfoConfig()
+      return await pendingInfoRequest
+    } finally {
+      pendingInfoRequest = null
+    }
+  }
+
+  /** 读取品牌配置，进行中的请求由 loadInfoConfig 统一合并。 */
+  async function fetchInfoConfig() {
     try {
       isLoading.value = true
       const response = await brandApi.getInfoConfig()
@@ -80,6 +122,7 @@ export const useInfoStore = defineStore('info', () => {
     isLoading,
     isLoaded,
     debugMode,
+    showDebugModal,
 
     // 计算属性
     organization,
@@ -87,7 +130,10 @@ export const useInfoStore = defineStore('info', () => {
     footer,
 
     // 方法
+    setDebugMode,
     toggleDebugMode,
+    openDebugModal,
+    closeDebugModal,
     loadInfoConfig
   }
 })

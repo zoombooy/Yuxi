@@ -5,6 +5,7 @@ import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from yuxi.config.options import ensure_options_in_db, update_option_value
+from yuxi.knowledge.parser.capabilities import PARSER_CAPABILITIES
 from yuxi.services import ocr_service
 from yuxi.storage.postgres.models_business import Base, ModelProvider
 
@@ -34,17 +35,27 @@ async def test_task_resolution_uses_database_option(db_session):
     assert resolved["_ocr_processor_kwargs"] == {"server_url": "http://mineru-config:30001/"}
 
 
-def test_resolve_ocr_engine_id_accepts_disable():
-    assert ocr_service.resolve_ocr_engine_id("disable") == "disable"
+@pytest.mark.asyncio
+async def test_ocr_options_use_parser_metadata(db_session, monkeypatch):
+    async def get_options(option, _db=None):
+        assert option is ocr_service.system_options
+        return {"default_ocr_engine": "rapid_ocr"}
 
+    monkeypatch.setattr(type(ocr_service.system_options), "get", get_options)
+    options = await ocr_service.get_ocr_options(db_session)
 
-def test_ocr_options_use_parser_metadata():
-    options = ocr_service.get_ocr_options()
-    rapid_ocr = next(item for item in options["engines"] if item["engine_id"] == "rapid_ocr")
-
-    assert rapid_ocr["service_name"] == "rapid_ocr"
-    assert rapid_ocr["display_name"] == "RapidOCR (ONNX)"
-    assert ".pdf" in rapid_ocr["supported_extensions"]
+    assert options == {
+        "default_engine": "rapid_ocr",
+        "engines": [
+            {
+                "engine_id": engine_id,
+                "service_name": capability.service_name,
+                "display_name": capability.display_name,
+                "supported_extensions": list(capability.supported_extensions),
+            }
+            for engine_id, capability in PARSER_CAPABILITIES.items()
+        ],
+    }
 
 
 @pytest.mark.asyncio
@@ -86,5 +97,5 @@ async def test_health_checks_every_registered_ocr_method(db_session, monkeypatch
 
     health = await ocr_service.check_all_ocr_health(db_session)
 
-    assert set(health) == set(ocr_service.PROCESSOR_TYPES)
+    assert set(health) == set(PARSER_CAPABILITIES)
     assert all(result["status"] == "healthy" for result in health.values())

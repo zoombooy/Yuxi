@@ -5,7 +5,7 @@
         <div class="disabled-content">
           <h4>知识图谱不可用</h4>
           <p>当前知识库类型 "{{ kbTypeLabel }}" 不支持知识图谱功能。</p>
-          <p>只有 Milvus 类型的知识库支持知识图谱。</p>
+          <p>只有 Yuxi 类型的知识库支持知识图谱。</p>
         </div>
       </div>
       <div v-else class="graph-wrapper">
@@ -420,7 +420,7 @@ import {
   Network,
   BrainCircuit,
   ScanText
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 import GraphCanvas from '@/components/GraphCanvas.vue'
 import GraphDetailPanel from '@/components/GraphDetailPanel.vue'
 import ResourceEmptyState from '@/components/shared/ResourceEmptyState.vue'
@@ -705,11 +705,12 @@ const configureGraphBuild = async () => {
 }
 
 const startGraphBuild = async () => {
+  const registerTask = taskerStore.createTaskRegistration()
   try {
     const data = await graphBuildApi.startIndex(kbId.value)
     message.success(data.message || '图谱构建任务已提交')
     if (data.task_id) {
-      taskerStore.registerQueuedTask({
+      registerTask({
         task_id: data.task_id,
         name: `图谱构建 (${kbId.value})`,
         task_type: GRAPH_BUILD_TASK_TYPE,
@@ -725,11 +726,12 @@ const startGraphBuild = async () => {
 }
 
 const retryGraphVectors = async () => {
+  const registerTask = taskerStore.createTaskRegistration()
   try {
     const data = await graphBuildApi.reconcile(kbId.value, 'failed')
     message.success(data.message || '图谱向量索引修复任务已提交')
     if (data.task_id) {
-      taskerStore.registerQueuedTask({
+      registerTask({
         task_id: data.task_id,
         name: `图谱向量索引修复 (${kbId.value})`,
         task_type: GRAPH_BUILD_TASK_TYPE,

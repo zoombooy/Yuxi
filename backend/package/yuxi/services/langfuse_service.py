@@ -5,6 +5,7 @@ import os
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any
+from urllib.parse import urlparse
 
 from yuxi.utils.logging_config import logger
 
@@ -17,6 +18,7 @@ except Exception:  # pragma: no cover - optional dependency during local test co
 
 
 _FALSE_VALUES = {"0", "false", "no", "off"}
+_DEFAULT_LANGFUSE_BASE_URL = "https://cloud.langfuse.com"
 
 
 @dataclass(slots=True)
@@ -165,10 +167,8 @@ def get_trace_info(run_context: LangfuseRunContext | None) -> dict[str, Any]:
 
     metadata = run_context.metadata or {}
     trace_id = run_context.trace_id
-    if run_context.callbacks:
-        last_trace_id = getattr(run_context.callbacks[0], "last_trace_id", None)
-        if last_trace_id:
-            trace_id = last_trace_id
+    if not trace_id and run_context.callbacks:
+        trace_id = getattr(run_context.callbacks[0], "last_trace_id", None)
 
     if not trace_id:
         return {}
@@ -182,7 +182,7 @@ def get_trace_info(run_context: LangfuseRunContext | None) -> dict[str, Any]:
     # Do not fetch trace_url on the request critical path. Langfuse resolves the
     # project id via a remote API call, which can add noticeable latency when the
     # base URL is slow or unreachable. If a trace URL is still needed, fetch it
-    # later via get_trace_url_async() and patch message metadata asynchronously.
+    # later via get_trace_url_by_id_async() and patch message metadata asynchronously.
     return trace_info
 
 
@@ -225,20 +225,20 @@ def submit_user_feedback_score(
         return False
 
 
-async def get_trace_url_async(
-    run_context: LangfuseRunContext | None,
-    *,
-    timeout: float = 5.0,
-) -> str | None:
-    if run_context is None:
+def _http_origin(url: str) -> tuple[str, str, int] | None:
+    try:
+        parsed_url = urlparse(url.strip())
+        if parsed_url.scheme not in {"http", "https"} or not parsed_url.hostname:
+            return None
+        default_port = 443 if parsed_url.scheme == "https" else 80
+        return parsed_url.scheme, parsed_url.hostname.casefold(), parsed_url.port or default_port
+    except ValueError:
         return None
 
-    trace_id = run_context.trace_id
-    if run_context.callbacks:
-        last_trace_id = getattr(run_context.callbacks[0], "last_trace_id", None)
-        if last_trace_id:
-            trace_id = last_trace_id
 
+async def get_trace_url_by_id_async(trace_id: str, *, timeout: float = 5.0) -> str | None:
+    """按 trace ID 惰性解析已配置 Langfuse 源站的页面 URL。"""
+    trace_id = str(trace_id or "").strip()
     if not trace_id:
         return None
 
@@ -247,12 +247,23 @@ async def get_trace_url_async(
         return None
 
     try:
-        return await asyncio.wait_for(
+        trace_url = await asyncio.wait_for(
             asyncio.to_thread(client.get_trace_url, trace_id=trace_id),
             timeout=timeout,
         )
-    except Exception:
+    except Exception as exc:
+        logger.warning(f"解析 Langfuse trace URL 失败: {type(exc).__name__}")
         return None
+
+    if not isinstance(trace_url, str):
+        return None
+
+    trace_url = trace_url.strip()
+    configured_origin = _http_origin(os.getenv("LANGFUSE_BASE_URL") or _DEFAULT_LANGFUSE_BASE_URL)
+    if configured_origin is None or _http_origin(trace_url) != configured_origin:
+        logger.warning("Langfuse 返回了非配置源站的 trace URL，已拒绝")
+        return None
+    return trace_url
 
 
 def flush_langfuse() -> None:

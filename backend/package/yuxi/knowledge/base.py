@@ -14,16 +14,6 @@ from yuxi.knowledge.schemas import (
     SearchResultSchema,
 )
 from yuxi.knowledge.utils import resolve_processing_params, sanitize_processing_params
-from yuxi.services.file_preview import (
-    MAX_BINARY_PREVIEW_SIZE_BYTES,
-    OfficePreviewConversionError,
-    convert_office_to_pdf,
-    detect_media_type,
-    is_binary_preview_type,
-    is_office_pdf_preview_file,
-    render_preview_payload,
-    render_preview_too_large_payload,
-)
 from yuxi.utils import logger
 from yuxi.utils.datetime_utils import utc_isoformat
 
@@ -60,12 +50,6 @@ class KBNotFoundError(KnowledgeBaseException):
 
 class KBNameConflictError(KnowledgeBaseException):
     """知识库名称冲突错误。"""
-
-    pass
-
-
-class KBOperationError(KnowledgeBaseException):
-    """知识库操作错误"""
 
     pass
 
@@ -260,6 +244,8 @@ class KnowledgeBase(ABC):
         operator_id: str | None = None,
         *,
         additional_params: dict[str, Any],
+        processing_task_id: str | None = None,
+        processing_owner: str | None = None,
     ) -> dict:
         """
         Parse file to Markdown and save to MinIO (Status: PARSING -> PARSED/ERROR_PARSING)
@@ -282,7 +268,17 @@ class KnowledgeBase(ABC):
         from yuxi.repositories.knowledge_file_repository import KnowledgeFileRepository
 
         file_repo = KnowledgeFileRepository()
-        claim_data = {"status": FileStatus.PARSING, "error_message": None}
+        owner_filter = (
+            {"processing_task_id": processing_task_id, "processing_owner": processing_owner}
+            if processing_task_id is not None and processing_owner is not None
+            else {}
+        )
+        claim_data = {
+            "status": FileStatus.PARSING,
+            "error_message": None,
+            "processing_task_id": processing_task_id,
+            "processing_owner": processing_owner,
+        }
         if operator_id:
             claim_data["updated_by"] = operator_id
         claimed_record = await file_repo.update_fields_if_status(
@@ -306,7 +302,16 @@ class KnowledgeBase(ABC):
             update_data = {"status": FileStatus.ERROR_PARSING, "error_message": message}
             if operator_id:
                 update_data["updated_by"] = operator_id
-            await file_repo.update_fields(file_id=file_id, kb_id=kb_id, data=update_data)
+            update_data.update({"processing_task_id": None, "processing_owner": None})
+            updated_record = await file_repo.update_fields_if_status(
+                file_id=file_id,
+                kb_id=kb_id,
+                allowed_statuses={FileStatus.PARSING},
+                data=update_data,
+                **owner_filter,
+            )
+            if updated_record is None and processing_owner is not None:
+                raise asyncio.CancelledError("File processing owner was lost")
             raise ValueError(message)
 
         try:
@@ -317,7 +322,9 @@ class KnowledgeBase(ABC):
                 kb_additional_params=additional_params,
                 file_processing_params=file_meta.get("processing_params"),
             )
-            params["image_bucket"] = "public"
+            from yuxi.storage.minio import get_minio_client
+
+            params["image_bucket"] = get_minio_client().KB_BUCKETS["images"]
             params["image_prefix"] = f"{kb_id}/kb-images"
 
             markdown_content = await parse_document(
@@ -339,10 +346,20 @@ class KnowledgeBase(ABC):
                 "status": FileStatus.PARSED,
                 "markdown_file": markdown_file_path,
                 "error_message": None,
+                "processing_task_id": None,
+                "processing_owner": None,
             }
             if operator_id:
                 update_data["updated_by"] = operator_id
-            await file_repo.update_fields(file_id=file_id, kb_id=kb_id, data=update_data)
+            updated_record = await file_repo.update_fields_if_status(
+                file_id=file_id,
+                kb_id=kb_id,
+                allowed_statuses={FileStatus.PARSING},
+                data=update_data,
+                **owner_filter,
+            )
+            if updated_record is None:
+                raise asyncio.CancelledError("File processing owner was lost")
 
             return file_meta
 
@@ -359,10 +376,23 @@ class KnowledgeBase(ABC):
             file_meta["updated_at"] = utc_isoformat()
             if operator_id:
                 file_meta["updated_by"] = operator_id
-            update_data = {"status": FileStatus.ERROR_PARSING, "error_message": error_msg}
+            update_data = {
+                "status": FileStatus.ERROR_PARSING,
+                "error_message": error_msg,
+                "processing_task_id": None,
+                "processing_owner": None,
+            }
             if operator_id:
                 update_data["updated_by"] = operator_id
-            await file_repo.update_fields(file_id=file_id, kb_id=kb_id, data=update_data)
+            updated_record = await file_repo.update_fields_if_status(
+                file_id=file_id,
+                kb_id=kb_id,
+                allowed_statuses={FileStatus.PARSING},
+                data=update_data,
+                **owner_filter,
+            )
+            if updated_record is None and processing_owner is not None:
+                raise asyncio.CancelledError("File processing owner was lost")
 
             raise
 
@@ -400,16 +430,6 @@ class KnowledgeBase(ABC):
         from yuxi.repositories.knowledge_file_repository import KnowledgeFileRepository
 
         update_data = {"processing_params": sanitize_processing_params(current_params)}
-        if operator_id:
-            update_data["updated_by"] = operator_id
-        record = await KnowledgeFileRepository().update_fields(file_id=file_id, kb_id=kb_id, data=update_data)
-        if record is None:
-            raise ValueError(f"File {file_id} not found")
-
-    async def _mark_file_unparsed(self, kb_id: str, file_id: str, operator_id: str | None = None) -> None:
-        from yuxi.repositories.knowledge_file_repository import KnowledgeFileRepository
-
-        update_data = {"status": FileStatus.UPLOADED, "markdown_file": None, "error_message": None}
         if operator_id:
             update_data["updated_by"] = operator_id
         record = await KnowledgeFileRepository().update_fields(file_id=file_id, kb_id=kb_id, data=update_data)
@@ -538,109 +558,6 @@ class KnowledgeBase(ABC):
             ),
             "readonly": True,
         }
-
-    @staticmethod
-    def _office_pdf_preview_path(kb_id: str, file_id: str) -> str:
-        return f"{kb_id}/preview/{file_id}.pdf"
-
-    async def _ensure_office_pdf_preview(self, kb_id: str, file_id: str, file_meta: dict) -> str:
-        from yuxi.storage.minio import get_minio_client
-
-        filename = file_meta.get("filename") or file_meta.get("original_filename") or file_id
-        if not is_office_pdf_preview_file(filename):
-            raise ValueError("当前文件类型不支持 PDF 预览")
-
-        minio_client = get_minio_client()
-        bucket_name = minio_client.KB_BUCKETS["parsed"]
-        object_name = self._office_pdf_preview_path(kb_id, file_id)
-        if await minio_client.astat_file(bucket_name, object_name) is not None:
-            return f"minio://{bucket_name}/{object_name}"
-
-        original_path = self._original_file_path(file_meta)
-        if not original_path:
-            raise ValueError("文件没有可转换的原始内容")
-
-        raw_content = await self._read_minio_bytes(original_path)
-        try:
-            pdf_content = await convert_office_to_pdf(filename, raw_content)
-        except OfficePreviewConversionError as exc:
-            raise ValueError(str(exc)) from exc
-        await minio_client.aupload_file(
-            bucket_name=bucket_name,
-            object_name=object_name,
-            data=pdf_content,
-            content_type="application/pdf",
-        )
-        return f"minio://{bucket_name}/{object_name}"
-
-    async def _get_minio_file_size(self, file_path: str) -> int | None:
-        from yuxi.knowledge.utils.kb_utils import is_minio_url, parse_minio_url
-        from yuxi.storage.minio import get_minio_client
-
-        if not file_path or not is_minio_url(file_path):
-            return None
-        bucket_name, object_name = parse_minio_url(file_path)
-        return await get_minio_client().astat_file(bucket_name, object_name)
-
-    async def read_file_preview(self, kb_id: str, file_id: str) -> dict:
-        file_meta = await self._get_file_meta(kb_id, file_id)
-        if file_meta.get("is_folder"):
-            raise ValueError("Cannot preview a folder")
-
-        filename = file_meta.get("filename") or file_meta.get("original_filename") or file_id
-        response = {
-            "source": "knowledge",
-            "kb_id": kb_id,
-            "file_id": file_id,
-            "filename": filename,
-            "readonly": True,
-        }
-
-        original_path = self._original_file_path(file_meta)
-        if not original_path:
-            return {
-                **response,
-                "content": None,
-                "preview_type": "unsupported",
-                "supported": False,
-                "message": "文件没有可预览的原始内容",
-            }
-
-        file_size = file_meta.get("size")
-        if file_size is None:
-            file_size = await self._get_minio_file_size(original_path)
-        if file_size is not None and int(file_size) > MAX_BINARY_PREVIEW_SIZE_BYTES:
-            return {**response, **render_preview_too_large_payload()}
-
-        if is_office_pdf_preview_file(filename):
-            preview_path = await self._ensure_office_pdf_preview(kb_id, file_id, file_meta)
-            stem = filename.rsplit(".", 1)[0] or file_id
-            return {
-                **response,
-                "content": await self._read_minio_bytes(preview_path),
-                "filename": f"{stem}.pdf",
-                "media_type": "application/pdf",
-                "preview_type": "pdf",
-                "supported": True,
-                "message": None,
-                "binary": True,
-            }
-
-        raw_content = await self._read_minio_bytes(original_path)
-        if len(raw_content) > MAX_BINARY_PREVIEW_SIZE_BYTES:
-            return {**response, **render_preview_too_large_payload()}
-        payload = render_preview_payload(filename, raw_content)
-        if is_binary_preview_type(payload["preview_type"]) and payload["supported"]:
-            return {
-                **response,
-                "content": raw_content,
-                "media_type": detect_media_type(filename, raw_content),
-                "preview_type": payload["preview_type"],
-                "supported": True,
-                "message": None,
-                "binary": True,
-            }
-        return {**response, **payload}
 
     async def get_file_download(self, kb_id: str, file_id: str, variant: str = "original") -> dict:
         file_meta = await self._get_file_meta(kb_id, file_id)
@@ -851,6 +768,8 @@ class KnowledgeBase(ABC):
         *,
         embedding_model_spec: str | None,
         additional_params: dict[str, Any],
+        processing_task_id: str | None = None,
+        processing_owner: str | None = None,
     ) -> dict:
         """
         Index parsed file (Status: INDEXING -> INDEXED/ERROR_INDEXING)
@@ -936,8 +855,14 @@ class KnowledgeBase(ABC):
         """检测当前知识库类型管理的外部资源不一致。"""
         return {"missing_collections": [], "missing_files": []}
 
-    async def create_folder(self, kb_id: str, folder_name: str, parent_id: str | None = None) -> dict:
-        """Create a folder in the database."""
+    async def create_folder(
+        self,
+        kb_id: str,
+        folder_name: str,
+        parent_id: str | None = None,
+        operator_id: str | None = None,
+    ) -> dict:
+        """创建文件夹并记录操作者。"""
         import uuid
 
         if parent_id:
@@ -957,32 +882,33 @@ class KnowledgeBase(ABC):
             "status": "done",
             "path": folder_name,
             "file_type": "folder",
+            "created_by": operator_id,
         }
         await self._persist_file_meta(folder_id, folder_meta)
         return folder_meta
 
-    @abstractmethod
-    async def update_content(
-        self,
-        kb_id: str,
-        file_ids: list[str],
-        params: dict | None = None,
-        *,
-        embedding_model_spec: str | None,
-        additional_params: dict[str, Any],
-    ) -> list[dict]:
-        """
-        更新内容 - 根据file_ids重新解析文件并更新向量库
+    async def rename_folder(self, kb_id: str, folder_id: str, folder_name: str) -> dict:
+        """重命名真实文件夹，不改写其子记录。"""
+        normalized_name = folder_name.strip()
+        if not normalized_name:
+            raise ValueError("Folder name cannot be empty")
+        if "/" in normalized_name or "\\" in normalized_name:
+            raise ValueError("Folder name cannot contain path separators")
 
-        Args:
-            kb_id: 数据库ID
-            file_ids: 文件ID列表
-            params: 处理参数
+        meta = await self._load_file_meta(kb_id, folder_id)
+        if not meta.get("is_folder"):
+            raise ValueError("Document is not a folder")
 
-        Returns:
-            更新结果列表
-        """
-        pass
+        from yuxi.repositories.knowledge_file_repository import KnowledgeFileRepository
+
+        record = await KnowledgeFileRepository().update_fields(
+            file_id=folder_id,
+            kb_id=kb_id,
+            data={"filename": normalized_name, "path": normalized_name},
+        )
+        if record is None:
+            raise ValueError(f"File {folder_id} not found")
+        return self._file_record_to_meta(record)
 
     @abstractmethod
     async def aquery(
@@ -1121,10 +1047,8 @@ class KnowledgeBase(ABC):
                     updated_files += 1
                     await file_repo.update_fields(file_id=file_id, kb_id=kb_id, data=update_data)
 
-        stats = await file_repo.get_kb_file_stats(kb_id)
         return {
             "status": "success",
-            "stats": stats,
             "scanned_files": scanned_files,
             "scanned_indexed_files": scanned_indexed_files,
             "skipped_unindexed_files": skipped_file_count,
@@ -1170,31 +1094,36 @@ class KnowledgeBase(ABC):
         Returns:
             dict: Updated metadata
         """
-        meta = await self._load_file_meta(kb_id, file_id)
+        from yuxi.repositories.knowledge_file_repository import KnowledgeFileRepository
 
-        # Basic cycle detection for folders
-        if meta.get("is_folder") and new_parent_id:
-            # Check if new_parent_id is a child of file_id (or is file_id itself)
-            if new_parent_id == file_id:
-                raise ValueError("Cannot move a folder into itself")
+        async with KnowledgeFileRepository().lock_file_tree(kb_id):
+            meta = await self._load_file_meta(kb_id, file_id)
 
-            # Walk up the tree from new_parent_id
-            current = new_parent_id
-            while current:
-                parent_meta = await self._load_file_meta(kb_id, current)
-                if current == new_parent_id and not parent_meta.get("is_folder"):
+            if meta.get("is_folder") and new_parent_id:
+                if new_parent_id == file_id:
+                    raise ValueError("Cannot move a folder into itself")
+
+                current = new_parent_id
+                while current:
+                    parent_meta = await self._load_file_meta(kb_id, current)
+                    if current == new_parent_id and not parent_meta.get("is_folder"):
+                        raise ValueError("Parent is not a folder")
+                    if current == file_id:
+                        raise ValueError("Cannot move a folder into its own subfolder")
+                    current = parent_meta.get("parent_id")
+            elif new_parent_id:
+                parent_meta = await self._load_file_meta(kb_id, new_parent_id)
+                if not parent_meta.get("is_folder"):
                     raise ValueError("Parent is not a folder")
-                if current == file_id:
-                    raise ValueError("Cannot move a folder into its own subfolder")
-                current = parent_meta.get("parent_id")
-        elif new_parent_id:
-            parent_meta = await self._load_file_meta(kb_id, new_parent_id)
-            if not parent_meta.get("is_folder"):
-                raise ValueError("Parent is not a folder")
 
-        meta["parent_id"] = new_parent_id
-        await self._persist_file_meta(file_id, meta)
-        return meta
+            record = await KnowledgeFileRepository().update_fields(
+                file_id=file_id,
+                kb_id=kb_id,
+                data={"parent_id": new_parent_id},
+            )
+            if record is None:
+                raise ValueError(f"File {file_id} not found")
+            return self._file_record_to_meta(record)
 
     @abstractmethod
     async def delete_file(self, kb_id: str, file_id: str) -> None:

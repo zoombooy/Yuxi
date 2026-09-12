@@ -9,6 +9,9 @@ import httpx
 import pytest
 from PIL import Image, ImageDraw, ImageFont
 
+from e2e_helpers import delete_agent
+from test.live_api_cleanup import make_test_conversation_metadata, make_test_conversation_title
+
 pytestmark = [pytest.mark.asyncio, pytest.mark.e2e, pytest.mark.slow]
 
 RUN_TIMEOUT_SECONDS = int(os.getenv("E2E_RUN_TIMEOUT_SECONDS", "240"))
@@ -63,8 +66,8 @@ async def _create_thread(client: httpx.AsyncClient, headers: dict[str, str], age
         "/api/chat/thread",
         json={
             "agent_id": agent_slug,
-            "title": f"read-file-e2e-{uuid.uuid4().hex[:8]}",
-            "metadata": {"_yuxi_e2e": True, "test": "read-file-e2e"},
+            "title": make_test_conversation_title("read-file-e2e"),
+            "metadata": make_test_conversation_metadata("read-file-e2e", e2e=True),
         },
         headers=headers,
     )
@@ -94,9 +97,7 @@ async def _upload(
         json={
             "attachments": [
                 {
-                    "file_name": uploaded["file_name"],
                     "file_type": uploaded.get("file_type"),
-                    "bucket_name": uploaded["bucket_name"],
                     "object_name": uploaded["object_name"],
                 }
             ]
@@ -145,11 +146,6 @@ async def _run(
             return str(payload.get("output") or "")
         await asyncio.sleep(2)
     pytest.fail(f"read_file E2E run timed out: {run_id}")
-
-
-async def _delete_agent(client: httpx.AsyncClient, headers: dict[str, str], slug: str) -> None:
-    response = await client.delete(f"/api/agent/{slug}", headers=headers)
-    assert response.status_code in {200, 404}, response.text
 
 
 def _write_test_image(path: Path) -> None:
@@ -214,7 +210,7 @@ async def test_read_file_image_and_document_real_agent_runs(
         )
         assert "ocr_parse_file" in document_output, document_output
     finally:
-        await _delete_agent(e2e_client, e2e_headers, slug)
+        await delete_agent(e2e_client, e2e_headers, slug)
 
 
 async def test_non_vision_model_uses_ocr_fallback(
@@ -247,4 +243,4 @@ async def test_non_vision_model_uses_ocr_fallback(
         )
         assert "OCR FALLBACK OK" in " ".join(output.upper().split()), output
     finally:
-        await _delete_agent(e2e_client, e2e_headers, slug)
+        await delete_agent(e2e_client, e2e_headers, slug)

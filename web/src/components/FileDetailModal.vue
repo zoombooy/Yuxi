@@ -60,13 +60,11 @@
     </div>
     <div v-else-if="file && hasAvailableView" class="file-detail-content">
       <div v-if="viewMode === 'source'" class="content-panel source-panel">
-        <div v-if="sourcePreview.loading" class="loading-container">
-          <a-spin tip="正在加载源文件预览..." />
-        </div>
         <AgentFilePreview
-          v-else
           :file="sourcePreviewFile"
           :file-path="file?.filename || ''"
+          :status="sourcePreview.loading ? 'loading' : ''"
+          loading-message="正在加载文件内容..."
           :show-header="false"
           :show-download="false"
           :show-inline-html-controls="true"
@@ -126,6 +124,7 @@ import { documentApi } from '@/apis/knowledge_api'
 import { getWorkspaceKnowledgeFileContent } from '@/apis/workspace_api'
 import { mergeChunks } from '@/utils/chunkUtils'
 import { getPreviewTypeByPath, normalizePreviewResponse } from '@/utils/file_preview'
+import { parseDownloadFilename } from '@/utils/file_utils'
 import {
   canPreviewChunks,
   canPreviewOriginal,
@@ -135,7 +134,7 @@ import {
 import MarkdownPreview from '@/components/common/MarkdownPreview.vue'
 import FileTypeIcon from '@/components/common/FileTypeIcon.vue'
 import AgentFilePreview from '@/components/AgentFilePreview.vue'
-import { Download, ChevronDown, FileSearch, FileText, Rows3, X } from 'lucide-vue-next'
+import { Download, ChevronDown, FileSearch, FileText, Rows3, X } from '@lucide/vue'
 
 const props = defineProps({
   open: {
@@ -262,12 +261,27 @@ const sourceContentLength = computed(() =>
 )
 const sourcePreviewFile = computed(() => {
   if (!file.value) return null
+  const isError = Boolean(
+    sourcePreview.value.message &&
+    !sourcePreview.value.supported &&
+    !sourcePreview.value.content &&
+    !sourcePreview.value.url
+  )
   return {
     ...file.value,
     content: sourcePreview.value.content,
     previewType: sourcePreviewDisplayType.value,
     previewUrl: sourcePreview.value.url,
     supported: sourcePreview.value.supported,
+    status: sourcePreview.value.loading
+      ? 'loading'
+      : isError
+        ? 'error'
+        : sourcePreview.value.supported === false
+          ? 'unsupported'
+          : 'ready',
+    errorMessage: sourcePreview.value.message,
+    loadingMessage: '正在加载文件内容...',
     message: sourcePreview.value.message
   }
 })
@@ -527,33 +541,8 @@ const handleDownloadOriginal = async () => {
   try {
     const response = await documentApi.downloadDocument(props.kbId, props.fileId)
 
-    // 获取文件名
     const contentDisposition = response.headers.get('content-disposition')
-    let filename = file.value.filename
-    if (contentDisposition) {
-      // 首先尝试匹配RFC 2231格式 filename*=UTF-8''...
-      const rfc2231Match = contentDisposition.match(/filename\*=UTF-8''([^;]+)/)
-      if (rfc2231Match) {
-        try {
-          filename = decodeURIComponent(rfc2231Match[1])
-        } catch (error) {
-          console.warn('Failed to decode RFC2231 filename:', rfc2231Match[1], error)
-        }
-      } else {
-        // 回退到标准格式 filename="..."
-        const filenameMatch = contentDisposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/)
-        if (filenameMatch && filenameMatch[1]) {
-          filename = filenameMatch[1].replace(/['"]/g, '')
-          // 解码URL编码的文件名
-          try {
-            filename = decodeURIComponent(filename)
-          } catch (error) {
-            console.warn('Failed to decode filename:', filename, error)
-          }
-        }
-      }
-    }
-
+    const filename = parseDownloadFilename(contentDisposition) || file.value.filename
     // 创建blob并下载
     const blob = await response.blob()
     const url = window.URL.createObjectURL(blob)

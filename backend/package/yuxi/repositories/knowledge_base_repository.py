@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from yuxi.knowledge.cache import cache_kb_config, delete_cached_kb_config, kb_config_cache_lock
 from yuxi.storage.postgres.manager import pg_manager
@@ -10,6 +10,14 @@ from yuxi.storage.postgres.models_knowledge import KnowledgeBase
 
 
 class KnowledgeBaseRepository:
+    async def count_by_type(self) -> list[tuple[str, int]]:
+        """按知识库类型聚合数量。"""
+        async with pg_manager.get_async_session_context() as session:
+            result = await session.execute(
+                select(KnowledgeBase.kb_type, func.count(KnowledgeBase.id)).group_by(KnowledgeBase.kb_type)
+            )
+            return [(str(kb_type or "unknown"), int(count or 0)) for kb_type, count in result.all()]
+
     async def get_all(self) -> list[KnowledgeBase]:
         async with pg_manager.get_async_session_context() as session:
             result = await session.execute(select(KnowledgeBase))
@@ -58,8 +66,10 @@ class KnowledgeBaseRepository:
                 kb.query_params = query_params
             return kb
 
-    async def update_stats(self, kb_id: str, stats: dict[str, int]) -> KnowledgeBase | None:
-        """在行锁内更新统计投影，保留并发写入的其他附加参数。"""
+    async def refresh_stats(self, kb_id: str) -> KnowledgeBase | None:
+        """在行锁内从文件聚合刷新统计，保留其他附加参数。"""
+        from yuxi.repositories.knowledge_file_repository import KnowledgeFileRepository
+
         async with kb_config_cache_lock(kb_id):
             async with pg_manager.get_async_session_context() as session:
                 statement = select(KnowledgeBase).where(KnowledgeBase.kb_id == kb_id).with_for_update()
@@ -68,6 +78,8 @@ class KnowledgeBaseRepository:
                 if kb is None:
                     return None
 
+                # 聚合必须在取得行锁后执行，避免较早的快照晚写覆盖新结果。
+                stats = await KnowledgeFileRepository().query_kb_file_stats(kb_id, session=session)
                 additional_params = dict(kb.additional_params or {})
                 additional_params["stats"] = stats
                 kb.additional_params = additional_params

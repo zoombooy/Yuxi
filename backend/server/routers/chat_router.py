@@ -2,43 +2,41 @@ import traceback
 import uuid
 from typing import Any
 
-import aiofiles
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, UploadFile, File
-from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from yuxi.storage.postgres.models_business import User
-from server.utils.auth_middleware import get_db, get_required_user
-from yuxi import config as conf
+from server.utils.auth_middleware import get_db, get_required_user, get_superadmin_user
+from yuxi.config.options import system_options
 from yuxi.agents.tool_approval import ToolApprovalMode
 from yuxi.models import select_model
-from yuxi.services.chat_service import get_agent_state_view
-from yuxi.services.conversation_service import (
+from yuxi.services.attachment_service import (
     confirm_tmp_thread_attachments_view,
-    create_thread_view,
     delete_thread_attachment_view,
-    delete_thread_view,
-    get_thread_history_view,
     list_thread_attachments_view,
-    list_threads_view,
     parse_tmp_attachment_view,
-    search_threads_view,
-    update_thread_view,
-    upload_thread_attachment_view,
     upload_tmp_attachment_view,
 )
-from yuxi.services.file_preview import detect_media_type
-from yuxi.services.thread_files_service import (
-    list_thread_files_view,
-    read_thread_file_content_view,
+from yuxi.services.chat_service import get_agent_state_view
+from yuxi.services.conversation_service import (
+    create_thread_view,
+    delete_thread_view,
+    get_thread_history_view,
+    get_thread_message_audits_view,
+    list_threads_view,
+    mark_thread_viewed_view,
+    search_threads_view,
+    update_thread_view,
+)
+from yuxi.services.artifact_service import (
     resolve_thread_artifact_view,
     save_thread_artifact_to_workspace_view,
 )
 from yuxi.services.feedback_service import get_message_feedback_view, submit_message_feedback_view
+from yuxi.services.context_compression_service import compress_thread_context as compress_context
 from yuxi.utils.logging_config import logger
 from yuxi.utils.image_processor import process_uploaded_image
-from yuxi.utils.paths import VIRTUAL_PATH_PREFIX
 
 
 # TODO：当前文件的功能过于庞杂，路由标签混乱
@@ -61,7 +59,12 @@ chat = APIRouter(prefix="/chat", tags=["chat"])
 
 
 @chat.post("/call")
-async def call(query: str = Body(...), meta: dict = Body(None), current_user: User = Depends(get_required_user)):
+async def call(
+    query: str = Body(...),
+    meta: dict = Body(None),
+    current_user: User = Depends(get_required_user),
+    db: AsyncSession = Depends(get_db),
+):
     """调用模型进行简单问答（需要登录）"""
     meta = meta or {}
 
@@ -69,7 +72,8 @@ async def call(query: str = Body(...), meta: dict = Body(None), current_user: Us
     if "request_id" not in meta or not meta.get("request_id"):
         meta["request_id"] = str(uuid.uuid4())
 
-    model = select_model(model_spec=meta.get("model_spec") or meta.get("model") or conf.default_model)
+    options = await system_options.get(db)
+    model = select_model(model_spec=meta.get("model_spec") or meta.get("model") or options["default_model"])
 
     response = await model.call(query)
     logger.debug({"query": query, "response": response.content})
@@ -81,7 +85,7 @@ async def call(query: str = Body(...), meta: dict = Body(None), current_user: Us
 async def get_thread_history(
     thread_id: str, current_user: User = Depends(get_required_user), db: AsyncSession = Depends(get_db)
 ):
-    """获取对话历史消息（需要登录）- 包含用户反馈状态"""
+    """读取当前用户的线程信息、Run 与历史消息。"""
     try:
         return await get_thread_history_view(
             thread_id=thread_id,
@@ -89,9 +93,31 @@ async def get_thread_history(
             db=db,
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"获取对话历史消息出错: {e}, {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"获取对话历史消息出错: {str(e)}")
+
+
+@chat.get("/thread/{thread_id}/audits")
+async def get_thread_message_audits(
+    thread_id: str,
+    current_user: User = Depends(get_superadmin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """读取超级管理员自身线程内的 Model/Tool 生命周期审计。"""
+    try:
+        return await get_thread_message_audits_view(
+            thread_id=thread_id,
+            current_uid=str(current_user.uid),
+            db=db,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"获取 Message 审计出错: {exc}, {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail="获取 Message 审计出错") from exc
 
 
 @chat.get("/thread/{thread_id}/state")
@@ -116,13 +142,33 @@ async def get_thread_state(
         raise HTTPException(status_code=500, detail=f"获取对话状态出错: {str(e)}")
 
 
+@chat.post("/thread/{thread_id}/compress")
+async def compress_thread_context(
+    thread_id: str,
+    current_user: User = Depends(get_required_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """在线程空闲时主动压缩上下文。"""
+    return await compress_context(
+        thread_id=thread_id,
+        current_user=current_user,
+        db=db,
+    )
+
+
 # ==================== 线程管理 API ====================
 
 
 class ThreadCreate(BaseModel):
+    """新线程创建请求，只允许在创建时选择 Project。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str | None = Field(None, max_length=64)
     title: str | None = None
     agent_id: str
     metadata: dict | None = None
+    project_id: str | None = None
 
 
 class ThreadResponse(BaseModel):
@@ -131,9 +177,12 @@ class ThreadResponse(BaseModel):
     agent_id: str
     title: str | None = None
     is_pinned: bool = False
+    project_id: str | None = None
+    workdir_path: str
     created_at: str
     updated_at: str
     metadata: dict[str, Any] = Field(default_factory=dict)
+    thread_status: str = "done"
 
 
 class ThreadSearchSnippet(BaseModel):
@@ -168,7 +217,6 @@ class AttachmentResponse(BaseModel):
     artifact_url: str | None = None
     original_path: str | None = None
     original_artifact_url: str | None = None
-    minio_url: str | None = None
     request_id: str | None = None
 
 
@@ -183,13 +231,10 @@ class AttachmentListResponse(BaseModel):
 
 
 class TmpAttachmentResponse(BaseModel):
-    tmp_file_id: str
     file_name: str
     file_type: str | None = None
     file_size: int
-    bucket_name: str
     object_name: str
-    minio_url: str
     uploaded_at: str
     parse_supported: bool = False
     parse_methods: list[str] = Field(default_factory=list)
@@ -197,30 +242,20 @@ class TmpAttachmentResponse(BaseModel):
 
 class TmpAttachmentParseRequest(BaseModel):
     object_name: str
-    file_name: str
     parse_method: str | None = None
-    bucket_name: str | None = None
 
 
 class TmpAttachmentParseResponse(BaseModel):
-    tmp_file_id: str
-    file_name: str
-    bucket_name: str
-    object_name: str
     parsed_object_name: str
-    parsed_minio_url: str
     parse_method: str
     status: str
     truncated: bool = False
 
 
 class TmpAttachmentConfirmItem(BaseModel):
-    file_name: str
     file_type: str | None = None
-    bucket_name: str
     object_name: str
     parsed_object_name: str | None = None
-    truncated: bool = False
 
 
 class TmpAttachmentConfirmRequest(BaseModel):
@@ -231,31 +266,9 @@ class TmpAttachmentConfirmResponse(BaseModel):
     attachments: list[AttachmentResponse]
 
 
-class ThreadFileEntry(BaseModel):
-    path: str
-    name: str
-    is_dir: bool
-    size: int
-    modified_at: str | None = None
-    artifact_url: str | None = None
-
-
-class ThreadFileListResponse(BaseModel):
-    path: str
-    files: list[ThreadFileEntry]
-
-
-class ThreadFileContentResponse(BaseModel):
-    path: str
-    content: list[str]
-    offset: int
-    limit: int
-    total_lines: int
-    artifact_url: str
-
-
 class SaveThreadArtifactRequest(BaseModel):
     path: str
+    destination_path: str | None = None
 
 
 class SaveThreadArtifactResponse(BaseModel):
@@ -277,8 +290,10 @@ async def create_thread(
     """创建新对话线程 (使用新存储系统)"""
     return await create_thread_view(
         agent_slug=thread.agent_id,
+        request_id=thread.request_id,
         title=thread.title,
         metadata=thread.metadata,
+        project_id=thread.project_id,
         db=db,
         current_uid=str(current_user.uid),
     )
@@ -327,6 +342,10 @@ async def delete_thread(
 
 
 class ThreadUpdate(BaseModel):
+    """线程可变展示字段，不接受绑定字段。"""
+
+    model_config = ConfigDict(extra="forbid")
+
     title: str | None = None
     is_pinned: bool | None = None
     tool_approval_mode: ToolApprovalMode | None = None
@@ -345,6 +364,20 @@ async def update_thread(
         title=thread_update.title,
         is_pinned=thread_update.is_pinned,
         tool_approval_mode=thread_update.tool_approval_mode,
+        db=db,
+        current_uid=str(current_user.uid),
+    )
+
+
+@chat.post("/thread/{thread_id}/viewed", response_model=ThreadResponse)
+async def mark_thread_viewed(
+    thread_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_required_user),
+):
+    """记录用户已查看该线程的最新顶层 run，清除侧边栏未读状态。"""
+    return await mark_thread_viewed_view(
+        thread_id=thread_id,
         db=db,
         current_uid=str(current_user.uid),
     )
@@ -369,9 +402,7 @@ async def parse_tmp_attachment(
     """解析 tmp 附件并返回解析后的 tmp URL。"""
     return await parse_tmp_attachment_view(
         object_name=request.object_name,
-        file_name=request.file_name,
         parse_method=request.parse_method,
-        bucket_name=request.bucket_name,
         current_uid=str(current_user.uid),
     )
 
@@ -387,22 +418,6 @@ async def confirm_tmp_thread_attachments(
     return await confirm_tmp_thread_attachments_view(
         thread_id=thread_id,
         attachments=[item.model_dump() for item in request.attachments],
-        db=db,
-        current_uid=str(current_user.uid),
-    )
-
-
-@chat.post("/thread/{thread_id}/attachments", response_model=AttachmentResponse)
-async def upload_thread_attachment(
-    thread_id: str,
-    file: UploadFile = File(...),
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_required_user),
-):
-    """上传原始附件并关联到指定对话线程。"""
-    return await upload_thread_attachment_view(
-        thread_id=thread_id,
-        file=file,
         db=db,
         current_uid=str(current_user.uid),
     )
@@ -438,65 +453,24 @@ async def delete_thread_attachment(
     )
 
 
-@chat.get("/thread/{thread_id}/files", response_model=ThreadFileListResponse)
-async def list_thread_files(
-    thread_id: str,
-    path: str = Query(f"{VIRTUAL_PATH_PREFIX}"),
-    recursive: bool = Query(False),
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_required_user),
-):
-    """列出线程文件目录。"""
-    return await list_thread_files_view(
-        thread_id=thread_id,
-        current_uid=str(current_user.uid),
-        db=db,
-        path=path,
-        recursive=recursive,
-    )
-
-
-@chat.get("/thread/{thread_id}/files/content", response_model=ThreadFileContentResponse)
-async def read_thread_file_content(
-    thread_id: str,
-    path: str = Query(...),
-    offset: int = Query(0, ge=0),
-    limit: int = Query(2000, ge=1, le=5000),
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_required_user),
-):
-    """读取线程文本文件（按行分页）。"""
-    return await read_thread_file_content_view(
-        thread_id=thread_id,
-        current_uid=str(current_user.uid),
-        db=db,
-        path=path,
-        offset=offset,
-        limit=limit,
-    )
-
-
 @chat.get("/thread/{thread_id}/artifacts/{path:path}")
 async def get_thread_artifact(
     thread_id: str,
     path: str,
     download: bool = Query(False),
+    preview: bool = Query(False),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_required_user),
 ):
     """下载或预览线程文件。"""
-    file_path = await resolve_thread_artifact_view(
+    return await resolve_thread_artifact_view(
         thread_id=thread_id,
         current_uid=str(current_user.uid),
         db=db,
         path=path,
+        download=download,
+        preview=preview,
     )
-
-    async with aiofiles.open(file_path, "rb") as artifact_file:
-        file_head = await artifact_file.read(512)
-    media_type = detect_media_type(file_path.name, file_head)
-    headers = {"Content-Disposition": f'attachment; filename="{file_path.name}"'} if download else None
-    return FileResponse(path=file_path, media_type=media_type, headers=headers)
 
 
 @chat.post("/thread/{thread_id}/artifacts/save", response_model=SaveThreadArtifactResponse)
@@ -506,12 +480,13 @@ async def save_thread_artifact_to_workspace(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_required_user),
 ):
-    """保存交付物到共享 workspace/saved_artifacts 目录。"""
+    """保存交付物到用户工作区中指定的目录。"""
     return await save_thread_artifact_to_workspace_view(
         thread_id=thread_id,
         current_uid=str(current_user.uid),
         db=db,
         path=request.path,
+        destination_path=request.destination_path,
     )
 
 

@@ -1,9 +1,10 @@
 import { createRouter, createWebHistory } from 'vue-router'
-import AppLayout from '@/layouts/AppLayout.vue'
 import BlankLayout from '@/layouts/BlankLayout.vue'
 import { useUserStore } from '@/stores/user'
 import { useAgentStore } from '@/stores/agent'
 import { sanitizeRedirect } from '@/utils/oidcAutoStart'
+
+const AppLayout = () => import('@/layouts/AppLayout.vue')
 
 const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
@@ -115,6 +116,16 @@ const router = createRouter({
               path: 'knowledgebase/:kbId',
               name: 'ExtensionKnowledgeBaseDetail',
               component: () => import('../views/DataBaseInfoView.vue'),
+              meta: {
+                keepAlive: false,
+                requiresAuth: true,
+                requiresAdmin: true
+              }
+            },
+            {
+              path: 'knowledgebase/:kbId/evaluation/:datasetId',
+              name: 'ExtensionEvaluationBenchmarkDetail',
+              component: () => import('../views/EvaluationBenchmarkDetailView.vue'),
               meta: {
                 keepAlive: false,
                 requiresAuth: true,

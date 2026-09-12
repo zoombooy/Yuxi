@@ -6,9 +6,10 @@
         <AgentChatComponent
           ref="chatComponentRef"
           :single-mode="false"
+          :initial-project-id="routeDraftProjectId"
           @thread-change="handleThreadChange"
         >
-          <template #input-actions-left="{ hasActiveThread }">
+          <template #input-actions-left="{ hasActiveThread, isCreatingThread }">
             <a-dropdown
               v-if="selectedAgentId"
               v-model:open="agentDropdownOpen"
@@ -20,7 +21,8 @@
                 ref="agentDropdownTriggerRef"
                 type="button"
                 class="input-action-btn config-dropdown-trigger"
-                :class="{ disabled: isLoadingConfig }"
+                :class="{ disabled: isLoadingConfig || isCreatingThread }"
+                :disabled="isCreatingThread"
                 :aria-label="currentAgentLabel"
               >
                 <FallbackAvatar
@@ -31,7 +33,7 @@
                   :name="currentAgentOption.label"
                   :seed="currentAgentOption.value || currentAgentOption.label"
                   kind="agent"
-                  :size="18"
+                  :size="20"
                   shape="rounded"
                   alt=""
                 />
@@ -50,7 +52,7 @@
                       selected: agent.value === selectedAgentId,
                       disabled: hasActiveThread && agent.value !== selectedAgentId
                     }"
-                    @click="handleAgentSwitch(agent.value, hasActiveThread)"
+                    @click="handleAgentSwitch(agent.value, hasActiveThread, isCreatingThread)"
                   >
                     <FallbackAvatar
                       class="config-dropdown-item-icon-image"
@@ -114,7 +116,7 @@
 <script setup>
 import { computed, nextTick, ref, watch } from 'vue'
 import { message } from 'ant-design-vue'
-import { Settings2, ChevronDown, Check, Plus } from 'lucide-vue-next'
+import { Settings2, ChevronDown, Check, Plus } from '@lucide/vue'
 import { useRoute, useRouter } from 'vue-router'
 import { agentApi } from '@/apis/agent_api'
 import { useOutsidePointerdown } from '@/composables/useOutsidePointerdown'
@@ -123,6 +125,7 @@ import AgentEditModal from '@/components/model-management/AgentEditModal.vue'
 import { isBuiltinAgent, useAgentStore } from '@/stores/agent'
 import { handleChatError } from '@/utils/errorHandler'
 import { generatePixelAvatar } from '@/utils/pixelAvatar'
+import { normalizeAgentBackendOption } from '@/utils/agentConfigUtils'
 import FallbackAvatar from '@/components/common/FallbackAvatar.vue'
 
 import { storeToRefs } from 'pinia'
@@ -151,6 +154,12 @@ const getRouteAgentId = () => {
   return typeof value === 'string' ? value : ''
 }
 
+const routeDraftProjectId = computed(() => {
+  if (getRouteThreadId()) return ''
+  const value = route.query.project_id
+  return typeof value === 'string' ? value : ''
+})
+
 const syncSelectedThreadFromRoute = async () => {
   const chatComponent = chatComponentRef.value
   if (!chatComponent?.selectThreadFromRoute) return
@@ -163,6 +172,7 @@ const syncSelectedThreadFromRoute = async () => {
     }
 
     const ok = await chatComponent.selectThreadFromRoute(threadId)
+    if (ok === null) return
     if (threadId && !ok) {
       await router.replace({ name: 'AgentComp' })
     }
@@ -183,7 +193,8 @@ const consumeRouteAgentSelection = async () => {
     }
 
     await nextTick()
-    await chatComponentRef.value?.selectThreadFromRoute?.('')
+    const canSwitch = await chatComponentRef.value?.selectThreadFromRoute?.('')
+    if (canSwitch === null) return
     await agentStore.selectAgent(targetAgentId)
   } catch (error) {
     handleChatError(error, 'load')
@@ -258,15 +269,16 @@ const agentBackendsLoaded = ref(false)
 const loadAgentBackends = async () => {
   if (agentBackendsLoaded.value) return
   const response = await agentApi.getAgentBackends()
-  agentBackendOptions.value = (response.backends || []).map((backend) => ({
-    label: backend.name || backend.backend_id,
-    value: backend.backend_id
-  }))
+  agentBackendOptions.value = (response.backends || []).map(normalizeAgentBackendOption)
   agentBackendsLoaded.value = true
 }
 
-const handleAgentSwitch = async (agentId, hasActiveThread) => {
+const handleAgentSwitch = async (agentId, hasActiveThread, isCreatingThread) => {
   if (!agentId || agentId === selectedAgentId.value) return
+  if (isCreatingThread) {
+    message.info('正在创建新对话，请稍候')
+    return
+  }
   if (hasActiveThread) {
     message.info('当前对话已绑定智能体，请新建对话后切换')
     return
@@ -401,120 +413,5 @@ useOutsidePointerdown(agentDropdownOpen, [agentDropdownTriggerRef, agentDropdown
   .config-dropdown-trigger {
     max-width: calc(100vw - 112px);
   }
-}
-</style>
-
-<style lang="less">
-.config-dropdown-overlay .config-dropdown-panel {
-  min-width: 188px;
-  max-width: min(260px, calc(100vw - 24px));
-  padding: 4px;
-  background: var(--gray-0);
-  border: 1px solid var(--gray-100);
-  border-radius: 8px;
-  box-shadow:
-    0 8px 24px rgba(0, 0, 0, 0.08),
-    0 2px 8px rgba(0, 0, 0, 0.04);
-}
-
-.config-dropdown-overlay .config-dropdown-item {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-  width: 100%;
-  padding: 6px 8px;
-  border: none;
-  border-radius: 6px;
-  background: transparent;
-  text-align: left;
-  cursor: pointer;
-  transition: background-color 0.15s ease;
-}
-
-.config-dropdown-overlay .config-dropdown-item:hover {
-  background: var(--gray-50);
-}
-
-.config-dropdown-overlay .config-dropdown-item.disabled {
-  cursor: not-allowed;
-  opacity: 0.55;
-}
-
-.config-dropdown-overlay .config-dropdown-item.selected {
-  background: var(--gray-50);
-}
-
-.config-dropdown-overlay .config-dropdown-item.action-item {
-  color: var(--gray-800);
-}
-
-.config-dropdown-overlay .config-dropdown-actions {
-  display: flex;
-}
-
-.config-dropdown-overlay .config-dropdown-actions .config-dropdown-item {
-  flex: 1;
-  width: auto;
-}
-
-.config-dropdown-overlay .config-dropdown-item-label {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 13px;
-  line-height: 1.35;
-  color: var(--gray-800);
-}
-
-.config-dropdown-overlay .config-dropdown-item-icon,
-.config-dropdown-overlay .config-dropdown-item-icon-image,
-.config-dropdown-overlay .config-dropdown-item-icon-empty {
-  flex-shrink: 0;
-}
-
-.config-dropdown-overlay .config-dropdown-item-icon {
-  color: var(--gray-500);
-}
-
-.config-dropdown-overlay .config-dropdown-item-icon-image,
-.config-dropdown-overlay .config-dropdown-item-icon-empty {
-  width: 24px;
-  height: 24px;
-  border-radius: 4px;
-}
-
-.config-dropdown-overlay .config-dropdown-item-icon-image {
-  object-fit: cover;
-}
-
-.config-dropdown-overlay .config-dropdown-item-badge {
-  flex-shrink: 0;
-  padding: 1px 6px;
-  border-radius: 999px;
-  background: var(--gray-100);
-  color: var(--gray-600);
-  font-size: 11px;
-  line-height: 1.4;
-}
-
-.config-dropdown-overlay .config-dropdown-item-check {
-  flex-shrink: 0;
-  color: var(--main-600);
-}
-
-.config-dropdown-overlay .config-dropdown-hint {
-  padding: 6px 8px;
-  color: var(--gray-500);
-  font-size: 12px;
-  line-height: 1.4;
-}
-
-.config-dropdown-overlay .config-dropdown-divider {
-  height: 1px;
-  margin: 4px 4px;
-  background: var(--gray-100);
 }
 </style>

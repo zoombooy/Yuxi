@@ -37,29 +37,12 @@
 
     <!-- 助手消息 -->
     <div v-else-if="message.type === 'ai'" class="assistant-message">
-      <div v-if="parsedData.reasoning_content" class="reasoning-box">
-        <button
-          type="button"
-          class="reasoning-summary"
-          :class="{ 'is-expanded': reasoningExpanded }"
-          :aria-expanded="!isReasoningActive && reasoningExpanded"
-          :disabled="isReasoningActive"
-          @click="toggleReasoningExpanded"
-        >
-          <span class="summary-leading">
-            <LoaderCircle v-if="isReasoningActive" size="14" class="reasoning-loading" />
-            <Brain v-else size="14" />
-          </span>
-          <span class="summary-title">{{ isReasoningActive ? 'Thinking...' : '推理过程' }}</span>
-          <span v-if="!isReasoningActive" class="summary-trailing">
-            <ChevronDown v-if="reasoningExpanded" size="14" />
-            <ChevronRight v-else size="14" />
-          </span>
-        </button>
-        <div v-if="!isReasoningActive && reasoningExpanded" class="reasoning-panel">
-          <p class="reasoning-content">{{ parsedData.reasoning_content }}</p>
-        </div>
-      </div>
+      <ToolCallsGroupComponent
+        v-if="!hideToolCalls && processEntries.length > 0"
+        :tool-calls="validToolCalls"
+        :entries="processEntries"
+        :is-active="isProcessing && !parsedData.content"
+      />
 
       <!-- 消息内容 -->
       <MarkdownPreview
@@ -70,23 +53,13 @@
         class="message-md"
       />
 
-      <div v-else-if="parsedData.reasoning_content" class="empty-block"></div>
-
       <!-- 错误提示块 -->
       <div v-if="displayError" class="error-hint">
         <span v-if="getErrorMessage">{{ getErrorMessage }}</span>
         <span v-else-if="message.error_type === 'interrupted'">回答生成已中断</span>
         <span v-else-if="message.error_type === 'unexpect'">生成过程中出现异常</span>
-        <span v-else-if="message.error_type === 'content_guard_blocked'"
-          >检测到敏感内容，已中断输出</span
-        >
         <span v-else>{{ message.error_type || '未知错误' }}</span>
       </div>
-
-      <ToolCallsGroupComponent
-        v-if="!hideToolCalls && validToolCalls.length > 0"
-        :tool-calls="validToolCalls"
-      />
 
       <div v-if="message.isStoppedByUser" class="retry-hint">
         你停止生成了本次回答
@@ -113,8 +86,6 @@
       </div>
       <!-- 错误消息 -->
     </div>
-
-    <div v-if="infoStore.debugMode" class="status-info">{{ message }}</div>
 
     <!-- 自定义内容 -->
     <slot></slot>
@@ -158,12 +129,11 @@
 <script setup>
 import { computed, ref, onUnmounted } from 'vue'
 import RefsComponent from '@/components/RefsComponent.vue'
-import { Brain, Check, ChevronDown, ChevronRight, Copy, LoaderCircle, X } from 'lucide-vue-next'
+import { Check, Copy, X } from '@lucide/vue'
 import ToolCallsGroupComponent from '@/components/ToolCallsGroupComponent.vue'
 import MarkdownPreview from '@/components/common/MarkdownPreview.vue'
 import MentionTextRenderer from '@/components/common/MentionTextRenderer.vue'
 import { useAgentStore } from '@/stores/agent'
-import { useInfoStore } from '@/stores/info'
 import { storeToRefs } from 'pinia'
 import { MessageProcessor } from '@/utils/messageProcessor'
 import { inferImageMimeTypeFromBase64, normalizeAttachmentPreviews } from '@/utils/file_utils'
@@ -204,11 +174,6 @@ const props = defineProps({
   mention: {
     type: Object,
     default: () => null
-  },
-  // 是否显示调试信息 (已废弃，使用 infoStore.debugMode)
-  debugMode: {
-    type: Boolean,
-    default: false
   }
 })
 
@@ -268,14 +233,23 @@ const copyToClipboard = async (text) => {
   }
 }
 
-// 推理面板展开状态
-const reasoningExpanded = ref(false)
-const isReasoningActive = computed(() => props.message.status === 'reasoning')
-
-const toggleReasoningExpanded = () => {
-  if (isReasoningActive.value) return
-  reasoningExpanded.value = !reasoningExpanded.value
-}
+const processEntries = computed(() => {
+  const entries = []
+  if (parsedData.value.reasoning_content) {
+    entries.push({
+      type: 'reasoning',
+      key: 'reasoning',
+      content: parsedData.value.reasoning_content
+    })
+  }
+  return entries.concat(
+    validToolCalls.value.map((toolCall, index) => ({
+      type: 'tool',
+      key: toolCall.id || `tool-${index}`,
+      toolCall
+    }))
+  )
+})
 
 // 错误消息处理
 const displayError = computed(() => {
@@ -298,8 +272,6 @@ const getErrorMessage = computed(() => {
   switch (props.message.error_type) {
     case 'interrupted':
       return '回答生成已中断'
-    case 'content_guard_blocked':
-      return '检测到敏感内容，已中断输出'
     case 'unexpect':
       return '生成过程中出现异常'
     case 'agent_error':
@@ -312,7 +284,7 @@ const getErrorMessage = computed(() => {
 // 引入智能体 store
 const agentStore = useAgentStore()
 const { availableKnowledgeBases } = storeToRefs(agentStore)
-const infoStore = useInfoStore()
+
 const messageAttachments = computed(() =>
   normalizeAttachmentPreviews(props.message.extra_metadata?.attachments)
 )
@@ -449,69 +421,6 @@ const parsedData = computed(() => {
   .searching-msg {
     color: var(--gray-700);
     animation: colorPulse 1s infinite ease-in-out;
-  }
-
-  .reasoning-box {
-    width: 100%;
-    padding: 0;
-    margin: 8px 0;
-
-    .reasoning-summary {
-      appearance: none;
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      max-width: 100%;
-      padding: 0;
-      border: none;
-      background: transparent;
-      color: var(--gray-700);
-      font-size: 13px;
-      line-height: 20px;
-      text-align: left;
-      cursor: pointer;
-      user-select: none;
-
-      &:hover:not(:disabled),
-      &.is-expanded {
-        color: var(--gray-800);
-      }
-
-      &:disabled {
-        cursor: default;
-      }
-
-      .summary-leading,
-      .summary-trailing {
-        display: inline-flex;
-        align-items: center;
-        flex-shrink: 0;
-        color: var(--gray-600);
-      }
-
-      .summary-title {
-        font-weight: 400;
-        white-space: nowrap;
-      }
-
-      .reasoning-loading {
-        animation: rotate 1s linear infinite;
-      }
-    }
-
-    .reasoning-panel {
-      margin-top: 4px;
-      padding: 4px 0 4px 22px;
-      border-top: 1px solid var(--gray-100);
-    }
-
-    .reasoning-content {
-      font-size: 13px;
-      color: var(--gray-800);
-      white-space: pre-wrap;
-      margin: 0;
-      line-height: 1.6;
-    }
   }
 
   .assistant-message {

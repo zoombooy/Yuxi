@@ -4,6 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from conftest import FakeGenerationKnowledgeBase, NoQueryKnowledgeBase, TrackingLlm, make_chunk
+
 os.environ.setdefault("OPENAI_API_KEY", "test-key")
 
 from yuxi.knowledge.eval import benchmark_generation
@@ -18,20 +20,6 @@ from yuxi.knowledge.eval.benchmark_generation import (
 )
 
 
-class FakeKnowledgeBase:
-    pass
-
-
-class FakeGenerationKnowledgeBase:
-    def __init__(self, query_results=None):
-        self.query_results = query_results or []
-        self.query_calls = []
-
-    async def aquery(self, query_text, kb_id, **kwargs):
-        self.query_calls.append({"query_text": query_text, "kb_id": kb_id, **kwargs})
-        return self.query_results
-
-
 class FakeLlm:
     def __init__(self, gold_chunk_id="anchor_chunk"):
         self.gold_chunk_id = gold_chunk_id
@@ -44,56 +32,8 @@ class FakeLlm:
         )
 
 
-class NoQueryKnowledgeBase(FakeGenerationKnowledgeBase):
-    async def aquery(self, query_text, kb_id, **kwargs):
-        raise AssertionError("neighbors_count=1 时不应调用 aquery")
-
-
-class TrackingLlm:
-    def __init__(self, content=None, delay=0):
-        self.content = content or '{"query":"问题","gold_answer":"答案","gold_chunk_ids":["anchor_chunk"]}'
-        self.delay = delay
-        self.active_calls = 0
-        self.max_active_calls = 0
-        self.calls = 0
-
-    async def call(self, prompt, stream):
-        self.calls += 1
-        self.active_calls += 1
-        self.max_active_calls = max(self.max_active_calls, self.active_calls)
-        try:
-            if self.delay:
-                await asyncio.sleep(self.delay)
-            return SimpleNamespace(content=self.content)
-        finally:
-            self.active_calls -= 1
-
-
 class FakeGraphGenerationKnowledgeBase(FakeGenerationKnowledgeBase):
     pass
-
-
-def make_chunk(
-    chunk_id: str,
-    *,
-    kb_id: str = "db_1",
-    file_id: str = "file_a",
-    content: str = "anchor content",
-    chunk_index: int = 0,
-    graph_indexed: bool = False,
-    ent_ids: list[str] | None = None,
-):
-    return SimpleNamespace(
-        chunk_id=chunk_id,
-        kb_id=kb_id,
-        file_id=file_id,
-        content=content,
-        chunk_index=chunk_index,
-        graph_indexed=graph_indexed,
-        ent_ids=ent_ids,
-        tags=None,
-        extraction_result=None,
-    )
 
 
 @pytest.fixture(autouse=True)
@@ -470,13 +410,20 @@ async def test_iter_generated_benchmark_items_drains_reorder_buffer_on_exception
     monkeypatch.setattr(benchmark_generation, "select_model", lambda model_spec: TrackingLlm())
     monkeypatch.setattr(benchmark_generation, "kb_manager", NoQueryKnowledgeBase())
     call_count = 0
+    first_call_started = asyncio.Event()
+    release_first_call = asyncio.Event()
 
     async def fake_generate(**kwargs):
         nonlocal call_count
         call_count += 1
         if call_count == 1:
-            await asyncio.sleep(0.1)
+            first_call_started.set()
+            await release_first_call.wait()
             raise RuntimeError("worker error")
+        if call_count == 2:
+            assert first_call_started.is_set()
+        if call_count == 4:
+            release_first_call.set()
         return {
             "query": f"q{call_count}",
             "gold_answer": "a",
@@ -498,7 +445,11 @@ async def test_iter_generated_benchmark_items_drains_reorder_buffer_on_exception
 
     # 无论哪个 worker 领到 attempt 0（延迟后抛异常），其他 worker 产出的 item
     # 都会因 next_attempt 游标未前进而卡在 reorder 缓冲中，经 drain 路径 yield
-    assert len(items) >= 1
+    assert items == [
+        {"query": "q2", "gold_answer": "a", "gold_chunk_ids": ["anchor_chunk"]},
+        {"query": "q3", "gold_answer": "a", "gold_chunk_ids": ["anchor_chunk"]},
+        {"query": "q4", "gold_answer": "a", "gold_chunk_ids": ["anchor_chunk"]},
+    ]
 
 
 @pytest.mark.asyncio

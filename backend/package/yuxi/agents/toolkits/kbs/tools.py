@@ -1,16 +1,16 @@
 """知识库工具模块"""
 
-from pathlib import Path
+import asyncio
+import os
+import tempfile
+from contextlib import suppress
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from langgraph.prebuilt.tool_node import ToolRuntime
 from pydantic import BaseModel, Field
 
-from yuxi.agents.backends.sandbox.paths import (
-    ensure_thread_dirs,
-    sandbox_outputs_dir,
-    virtual_path_for_thread_file,
-)
+from yuxi.agents.backends.sandbox import ProvisionerSandboxBackend
 from yuxi.agents.toolkits.registry import tool
 from yuxi.knowledge.schemas import (
     FindInputSchema,
@@ -52,7 +52,7 @@ class ListKBsInput(BaseModel):
     dummy: str = Field(default="", description="Dummy parameter - ignore")
 
 
-@tool(category="knowledge", tags=["知识库"], args_schema=ListKBsInput)
+@tool(category="knowledge", tags=["知识库"], display_name="列出知识库", args_schema=ListKBsInput)
 async def list_kbs(dummy: str, runtime: ToolRuntime) -> str:
     """列出当前用户可访问的知识库列表
 
@@ -88,7 +88,7 @@ class GetMindmapInput(BaseModel):
     kb_name: str = Field(description="知识库名称，用于指定要获取思维导图的知识库")
 
 
-@tool(category="knowledge", tags=["知识库"], args_schema=GetMindmapInput)
+@tool(category="knowledge", tags=["知识库"], display_name="获取思维导图", args_schema=GetMindmapInput)
 async def get_mindmap(kb_name: str, runtime: ToolRuntime) -> str:
     """获取指定知识库的思维导图结构
 
@@ -146,7 +146,7 @@ async def get_mindmap(kb_name: str, runtime: ToolRuntime) -> str:
 QueryKBInput = SearchInputSchema
 
 
-@tool(category="knowledge", tags=["知识库"], args_schema=QueryKBInput)
+@tool(category="knowledge", tags=["知识库"], display_name="检索知识库", args_schema=QueryKBInput)
 async def query_kb(kb_id: str, query_text: str, file_name: str | None = None, runtime: ToolRuntime = None) -> Any:
     """在指定知识库中检索内容
 
@@ -174,7 +174,7 @@ async def query_kb(kb_id: str, query_text: str, file_name: str | None = None, ru
 OpenKBDocumentInput = OpenInputSchema
 
 
-@tool(category="knowledge", tags=["知识库"], args_schema=OpenKBDocumentInput)
+@tool(category="knowledge", tags=["知识库"], display_name="打开知识库文档", args_schema=OpenKBDocumentInput)
 async def open_kb_document(
     kb_id: str,
     file_id: str,
@@ -216,7 +216,7 @@ async def open_kb_document(
 FindKBDocumentInput = FindInputSchema
 
 
-@tool(category="knowledge", tags=["知识库"], args_schema=FindKBDocumentInput)
+@tool(category="knowledge", tags=["知识库"], display_name="定位文档内容", args_schema=FindKBDocumentInput)
 async def find_kb_document(
     kb_id: str,
     file_id: str,
@@ -269,7 +269,7 @@ class SearchFileInput(BaseModel):
     limit: int = Field(default=300, ge=1, le=5000, description="返回数量限制，默认 300")
 
 
-@tool(category="knowledge", tags=["知识库"], args_schema=SearchFileInput)
+@tool(category="knowledge", tags=["知识库"], display_name="搜索知识库文件", args_schema=SearchFileInput)
 async def search_file(
     kb_name: str | None = None,
     query: str | None = None,
@@ -329,7 +329,7 @@ class DownloadKBFileInput(BaseModel):
     )
 
 
-@tool(category="knowledge", tags=["知识库"], args_schema=DownloadKBFileInput)
+@tool(category="knowledge", tags=["知识库"], display_name="下载知识库文件", args_schema=DownloadKBFileInput)
 async def download_kb_file(
     kb_id: str,
     file_id: str,
@@ -364,24 +364,42 @@ async def download_kb_file(
         logger.error(f"下载知识库原始文件失败: {e}")
         return f"下载知识库原始文件失败: {str(e)}"
 
-    file_thread_id = _runtime_thread_id(runtime)
-    uid = _runtime_uid(runtime)
-    if not file_thread_id or not uid:
-        return "无法获取当前会话的沙盒上下文，缺少 file_thread_id 或 uid"
+    sandbox_scope = _runtime_sandbox_scope(runtime)
+    if sandbox_scope is None:
+        return "无法获取当前会话的沙盒上下文，缺少 thread_id 或 uid"
+    runtime_thread_id, uid, workdir_relative_path, workdir_path = sandbox_scope
+    backend = ProvisionerSandboxBackend(
+        thread_id=runtime_thread_id,
+        uid=uid,
+        workdir_path=workdir_relative_path,
+        create_if_missing=True,
+    )
 
-    output_path = _resolve_download_output_path(file_thread_id, uid, data, normalized_file_id, save_as)
+    output_path = _resolve_download_output_path(backend, workdir_path, data, normalized_file_id, save_as)
+    temp_path = ""
     try:
-        output_path.write_bytes(data["content"])
-    except OSError as e:
+        with tempfile.NamedTemporaryFile(prefix="yuxi-kb-download-", delete=False) as temp_file:
+            temp_path = temp_file.name
+            temp_file.write(data["content"])
+        await asyncio.to_thread(
+            backend.upload_authorized_file_from_path,
+            output_path,
+            temp_path,
+        )
+    except (OSError, RuntimeError) as e:
         logger.error(f"写入沙盒 outputs 失败: {e}")
         return f"写入沙盒 outputs 失败: {str(e)}"
+    finally:
+        if temp_path:
+            with suppress(FileNotFoundError):
+                await asyncio.to_thread(os.unlink, temp_path)
 
     return {
-        "virtual_path": virtual_path_for_thread_file(file_thread_id, output_path, uid=uid),
+        "virtual_path": output_path,
         "filename": data["filename"] or normalized_file_id,
         "media_type": data["media_type"],
         "size_bytes": len(data["content"]),
-        "saved_as": output_path.name,
+        "saved_as": PurePosixPath(output_path).name,
     }
 
 
@@ -431,46 +449,47 @@ def _find_query_target(
     return normalized_kb_id, None
 
 
-def _runtime_thread_id(runtime: ToolRuntime | None) -> str | None:
-    """从 runtime.context 取 file_thread_id（回退 thread_id）。"""
+def _runtime_sandbox_scope(runtime: ToolRuntime | None) -> tuple[str, str, str, str] | None:
+    """返回知识库下载使用的 runtime、用户和 Workdir 路径。"""
     context = getattr(runtime, "context", None) if runtime else None
     if context is None:
         return None
-    return getattr(context, "file_thread_id", None) or getattr(context, "thread_id", None)
-
-
-def _runtime_uid(runtime: ToolRuntime | None) -> str | None:
-    """从 runtime.context 取 uid。"""
-    context = getattr(runtime, "context", None) if runtime else None
-    if context is None:
+    runtime_thread_id = getattr(context, "runtime_scope_id", None) or getattr(context, "thread_id", None)
+    uid = getattr(context, "uid", None)
+    workdir_relative_path = getattr(context, "workdir_relative_path", None)
+    workdir_path = getattr(context, "workdir_path", None)
+    if not runtime_thread_id or not uid or not workdir_relative_path or not workdir_path:
         return None
-    return getattr(context, "uid", None)
+    return (
+        str(runtime_thread_id),
+        str(uid),
+        str(workdir_relative_path),
+        str(workdir_path),
+    )
 
 
 def _resolve_download_output_path(
-    file_thread_id: str,
-    uid: str,
+    backend: ProvisionerSandboxBackend,
+    workdir_path: str,
     data: dict[str, Any],
     file_id: str,
     save_as: str | None,
-) -> Path:
+) -> str:
     """计算沙盒 outputs 目录下的落盘路径，处理重名与路径穿越防护。"""
-    ensure_thread_dirs(file_thread_id, uid)
-    outputs_dir = sandbox_outputs_dir(file_thread_id)
-
     # 仅取文件名部分，剥离任何目录，防止路径穿越
     wanted_name = (save_as or data.get("filename") or file_id).strip()
     base_name = Path(wanted_name).name or file_id
 
-    candidate = outputs_dir / base_name
-    if not candidate.exists():
+    candidate = f"{workdir_path}/outputs/{base_name}"
+    if not backend.regular_file_exists(candidate):
         return candidate
 
     # 重名时追加 _1 / _2 ... 后缀
-    stem = candidate.stem
-    suffix = candidate.suffix
+    pure_candidate = PurePosixPath(candidate)
+    stem = pure_candidate.stem
+    suffix = pure_candidate.suffix
     index = 1
-    while candidate.exists():
-        candidate = outputs_dir / f"{stem}_{index}{suffix}"
+    while backend.regular_file_exists(candidate):
+        candidate = f"{workdir_path}/outputs/{stem}_{index}{suffix}"
         index += 1
     return candidate

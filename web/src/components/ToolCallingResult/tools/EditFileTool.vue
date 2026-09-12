@@ -2,7 +2,7 @@
   <BaseToolCall :tool-call="toolCall">
     <template #header>
       <div class="sep-header">
-        <span class="note">Edit</span>
+        <span class="note">编辑文件</span>
         <span class="separator" v-if="filePath">|</span>
         <span class="description" :title="filePath">
           <span class="code">{{ fileName }}</span>
@@ -17,6 +17,7 @@
 <script setup>
 import { computed } from 'vue'
 import BaseToolCall from '../BaseToolCall.vue'
+import { parseToolCallArgs } from '../toolRegistry'
 
 const props = defineProps({
   toolCall: {
@@ -25,16 +26,7 @@ const props = defineProps({
   }
 })
 
-const parsedArgs = computed(() => {
-  const args = props.toolCall.args || props.toolCall.function?.arguments
-  if (!args) return {}
-  if (typeof args === 'object') return args
-  try {
-    return JSON.parse(args)
-  } catch {
-    return {}
-  }
-})
+const parsedArgs = computed(() => parseToolCallArgs(props.toolCall))
 
 const filePath = computed(() => parsedArgs.value.file_path || '')
 

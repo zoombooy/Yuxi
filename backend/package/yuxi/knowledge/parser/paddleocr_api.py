@@ -13,10 +13,13 @@ from urllib.parse import urlparse
 import requests
 
 from yuxi.knowledge.parser.base import BaseDocumentProcessor, DocumentParserException
+from yuxi.knowledge.parser.capabilities import get_parser_capability
 from yuxi.storage.minio import get_minio_client
 from yuxi.utils import logger
 
 DEFAULT_PADDLEOCR_API_URL = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
+_VL_CAPABILITY = get_parser_capability("paddleocr_vl_1_6")
+_OCRV6_CAPABILITY = get_parser_capability("paddleocr_pp_ocrv6")
 
 
 class PaddleOCRAPIParser(BaseDocumentProcessor):
@@ -26,7 +29,7 @@ class PaddleOCRAPIParser(BaseDocumentProcessor):
     service_name = ""
     display_name = ""
     default_optional_payload: dict[str, bool] = {}
-    supported_extensions = [".pdf", ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"]
+    supported_extensions = list(_VL_CAPABILITY.supported_extensions)
 
     def __init__(self, api_token: str | None = None, api_url: str | None = None):
         self.api_token = api_token or os.getenv("PADDLEOCR_API_TOKEN")
@@ -224,7 +227,7 @@ class PaddleOCRAPIParser(BaseDocumentProcessor):
                 "image_download_failed",
             )
 
-        image_bucket = params.get("image_bucket") or "public"
+        image_bucket = params.get("image_bucket") or get_minio_client().KB_BUCKETS["images"]
         image_prefix = str(params.get("image_prefix") or "unknown/kb-images").strip("/") or "unknown/kb-images"
         filename = Path(image_path).name or "paddleocr_image"
         suffix = Path(filename).suffix
@@ -236,20 +239,23 @@ class PaddleOCRAPIParser(BaseDocumentProcessor):
         object_name = f"{image_prefix}/{int(time.time() * 1000000)}_{filename}"
         minio_client = get_minio_client()
         minio_client.ensure_bucket_exists(image_bucket)
-        upload_result = minio_client.upload_file(
+        minio_client.upload_file(
             bucket_name=image_bucket,
             object_name=object_name,
             data=response.content,
         )
-        return upload_result.url
+        from yuxi.knowledge.utils.kb_utils import build_kb_image_proxy_url
+
+        return build_kb_image_proxy_url(object_name)
 
 
 class PaddleOCRVLParser(PaddleOCRAPIParser):
     """PaddleOCR-VL parser that returns layout Markdown."""
 
     model = "PaddleOCR-VL-1.6"
-    service_name = "paddleocr_vl_1_6"
-    display_name = "PaddleOCR-VL-1.6"
+    service_name = _VL_CAPABILITY.service_name
+    display_name = _VL_CAPABILITY.display_name
+    supported_extensions = list(_VL_CAPABILITY.supported_extensions)
     default_optional_payload = {
         "useDocOrientationClassify": False,
         "useDocUnwarping": False,
@@ -284,8 +290,9 @@ class PaddleOCRPPOCRv6Parser(PaddleOCRAPIParser):
     """PP-OCRv6 parser that returns plain OCR text."""
 
     model = "PP-OCRv6"
-    service_name = "paddleocr_pp_ocrv6"
-    display_name = "PP-OCRv6"
+    service_name = _OCRV6_CAPABILITY.service_name
+    display_name = _OCRV6_CAPABILITY.display_name
+    supported_extensions = list(_OCRV6_CAPABILITY.supported_extensions)
     default_optional_payload = {
         "useDocOrientationClassify": False,
         "useDocUnwarping": False,
