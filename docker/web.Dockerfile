@@ -1,5 +1,6 @@
 # 开发阶段
-FROM node:24-alpine AS development
+FROM node:22-bookworm AS development
+ENV UV_USE_IO_URING=0
 WORKDIR /app
 ENV TZ=Asia/Shanghai
 
@@ -12,7 +13,7 @@ COPY ./web/pnpm-lock.yaml* ./
 COPY ./web/pnpm-workspace.yaml ./
 
 # 安装依赖（--frozen-lockfile 保证 dev 与 build/CI 三处依赖与 pnpm-lock.yaml 一致，避免漂移）
-RUN pnpm install --frozen-lockfile --registry=https://registry.npmmirror.com
+RUN --mount=type=cache,target=/pnpm/store pnpm config set store-dir /pnpm/store && pnpm install --frozen-lockfile --registry=http://172.19.132.239:8081/nexus/repository/npm-group
 
 # 复制源代码
 COPY ./web .
@@ -23,7 +24,8 @@ EXPOSE 5173
 # 启动开发服务器的命令在 docker-compose 文件中定义
 
 # 生产阶段
-FROM node:24-alpine AS build-stage
+FROM node:22-bookworm AS build-stage
+ENV UV_USE_IO_URING=0
 WORKDIR /app
 
 # 安装 pnpm
@@ -35,14 +37,14 @@ COPY ./web/pnpm-lock.yaml* ./
 COPY ./web/pnpm-workspace.yaml ./
 
 # 安装依赖
-RUN pnpm install --frozen-lockfile --registry=https://registry.npmmirror.com
+RUN --mount=type=cache,target=/pnpm/store pnpm config set store-dir /pnpm/store && pnpm install --frozen-lockfile --registry=http://172.19.132.239:8081/nexus/repository/npm-group
 
 # 复制源代码并构建
 COPY ./web .
 RUN pnpm run build
 
 # 生产环境运行阶段
-FROM nginx:alpine AS production
+FROM nginx:1.27-bookworm AS production
 COPY --from=build-stage /app/dist /usr/share/nginx/html
 RUN find /usr/share/nginx/html -type d -exec chmod 755 {} \; \
     && find /usr/share/nginx/html -type f -exec chmod 644 {} \;
