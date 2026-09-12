@@ -5,7 +5,7 @@ WORKDIR /app
 ENV TZ=Asia/Shanghai
 
 # 安装 pnpm（版本与 package.json 的 packageManager 字段对齐，避免 pnpm@latest 与旧 lockfile 不兼容）
-RUN npm install -g pnpm@11.24.0
+RUN npm config set registry http://172.19.132.239:8081/nexus/repository/npm-group && npm install -g pnpm@11.24.0
 
 # 复制 pnpm 依赖声明与锁文件
 COPY ./web/package*.json ./
@@ -29,7 +29,7 @@ ENV UV_USE_IO_URING=0
 WORKDIR /app
 
 # 安装 pnpm
-RUN npm install -g pnpm@11.24.0
+RUN npm config set registry http://172.19.132.239:8081/nexus/repository/npm-group && npm install -g pnpm@11.24.0
 
 # 复制依赖文件
 COPY ./web/package*.json ./
