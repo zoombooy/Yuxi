@@ -6,13 +6,21 @@ from typing import Any
 from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 
-from yuxi.knowledge.graphs.graph_utils import normalize_entity_name
 from yuxi.storage.postgres.manager import pg_manager
 from yuxi.storage.postgres.models_knowledge import KnowledgeFact
 from yuxi.utils import hashstr
 
 FACT_STATUSES = (KnowledgeFact.STATUS_PENDING, KnowledgeFact.STATUS_APPROVED, KnowledgeFact.STATUS_REJECTED)
 LIST_STATUS_FILTERS = (*FACT_STATUSES, "invalidated", "all")
+
+
+def _normalize_entity_name(text: str | None) -> str:
+    """与 graph_utils.normalize_entity_name 语义一致。
+
+    故意不从这里导入：仓库层依赖 knowledge.graphs 会形成
+    repo → graphs.__init__ → milvus_graph_service → repo 的循环导入。
+    """
+    return " ".join((text or "").strip().lower().split())
 
 
 def compute_fact_id(kb_id: str, chunk_id: str, relation_index: int) -> str:
@@ -26,17 +34,17 @@ def find_supersede_candidates(new_fact, other_approved: list) -> list:
     重新断言）且尚未失效的批准事实。宾语不同的并行事实（如多个参会单位）不是
     冲突，不取代——功能性谓词的冲突裁决需要本体基数（后续治理阶段）。
     """
-    subject = normalize_entity_name(new_fact.subject_text or "")
+    subject = _normalize_entity_name(new_fact.subject_text or "")
     predicate = new_fact.predicate
-    object_key = normalize_entity_name(new_fact.object_text or "")
+    object_key = _normalize_entity_name(new_fact.object_text or "")
     candidates = []
     for other in other_approved:
         if other.id == new_fact.id:
             continue
         if (
-            normalize_entity_name(other.subject_text or "") == subject
+            _normalize_entity_name(other.subject_text or "") == subject
             and other.predicate == predicate
-            and normalize_entity_name(other.object_text or "") == object_key
+            and _normalize_entity_name(other.object_text or "") == object_key
         ):
             candidates.append(other)
     return candidates
@@ -260,7 +268,7 @@ class KnowledgeFactRepository:
         if file_id:
             conditions.append(KnowledgeFact.file_id == file_id)
         if subject:
-            conditions.append(func.lower(KnowledgeFact.subject_text) == normalize_entity_name(subject))
+            conditions.append(func.lower(KnowledgeFact.subject_text) == _normalize_entity_name(subject))
         order_by = KnowledgeFact.recorded_at.desc() if as_of is not None or subject else KnowledgeFact.id.desc()
         async with pg_manager.get_async_session_context() as session:
             total = await session.scalar(select(func.count()).select_from(KnowledgeFact).where(*conditions))
