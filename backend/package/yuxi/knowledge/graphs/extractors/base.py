@@ -111,6 +111,7 @@ def normalize_extraction_result(result: dict[str, Any], extractor_type: str) -> 
         if source is None or target is None or len(label) > MAX_RELATION_TYPE_LENGTH:
             dropped_relations += 1
             continue
+        time_role_raw = str(relation.get("time_role") or "").strip().lower()
         normalized_relations.append(
             {
                 "source": source,
@@ -120,6 +121,10 @@ def normalize_extraction_result(result: dict[str, Any], extractor_type: str) -> 
                 # 模型自评置信度（0~1）。治理层用它决定是否需要人审；无治理时被
                 # 下游写图路径忽略。非法值一律归 None（"模型没给"与"给了垃圾"同权）。
                 "confidence": _normalize_confidence(relation.get("confidence")),
+                # 原文时间表述摘录（utopia ADR 0044：模型只摘原文，不算日期）；
+                # 归一化在治理层的 governance_time 中确定性完成。
+                "time_text": str(relation.get("time_text") or "").strip()[:200] or None,
+                "time_role": time_role_raw if time_role_raw in ("start", "end", "point") else None,
             }
         )
 

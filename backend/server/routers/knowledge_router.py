@@ -660,10 +660,15 @@ async def list_governance_facts(
     file_id: str | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
+    as_of: str | None = Query(None, description="ISO 8601 时点，做世界轴判定"),
+    subject: str | None = Query(None, description="按归一化主语过滤（时间线查询）"),
     current_user: User = Depends(require_knowledge_base_read),
 ):
-    if status is not None and status not in {"pending", "approved", "rejected"}:
-        raise HTTPException(status_code=400, detail="status 必须是 pending、approved 或 rejected")
+    if status is not None and status not in {"pending", "approved", "rejected", "invalidated", "all"}:
+        raise HTTPException(
+            status_code=400,
+            detail="status 必须是 pending、approved、rejected、invalidated 或 all",
+        )
     try:
         return await MilvusGraphService().list_facts(
             kb_id,
@@ -671,6 +676,8 @@ async def list_governance_facts(
             file_id=file_id,
             page=page,
             page_size=page_size,
+            as_of=as_of,
+            subject=subject,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

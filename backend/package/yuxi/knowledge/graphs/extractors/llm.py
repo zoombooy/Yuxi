@@ -18,11 +18,16 @@ JSON 格式：
       "target": {"text": "实体文本", "label": "实体类型", "attributes": [{"text": "属性值", "label": "属性名称"}]},
       "text": "关系显示文本",
       "label": "关系类型",
-      "confidence": 0.0
+      "confidence": 0.0,
+      "time_text": "原文中的时间表述",
+      "time_role": "start"
     }
   ]
 }
 confidence 是可选字段：这条关系在原文中有明确依据给接近 1.0，属于推断或原文表述模糊则给低分。
+time_text 和 time_role 是可选字段：只摘录原文中标志这条关系开始/结束/发生时间的原话（如
+"2023年3月"、"2020年至今"、"已于2022年离职"），不要自己换算日期；time_role 取 start（关系的
+开始）、end（关系的结束）或 point（时点事件），省略表示原文没有时间信息。
 """
 
 SCHEMA_INSTRUCTION = """抽取 Schema 约束：

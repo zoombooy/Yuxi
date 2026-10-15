@@ -4,9 +4,11 @@ import asyncio
 import json
 import time
 import weakref
+from datetime import datetime, UTC
 from typing import Any
 
 from yuxi.knowledge.graphs.extractors import GraphExtractor, GraphExtractorFactory, normalize_extraction_result
+from yuxi.knowledge.graphs.governance_time import normalize_time_expression
 from yuxi.knowledge.graphs.graph_utils import (
     build_graph_payload,
     compute_entity_id,
@@ -744,9 +746,14 @@ class MilvusGraphService:
 
     @staticmethod
     def _build_fact_inputs(normalized_result: dict[str, Any]) -> list[dict[str, Any]]:
-        """把标准化抽取结果映射成事实队列的入参（顺序即 relation_index）。"""
+        """把标准化抽取结果映射成事实队列的入参（顺序即 relation_index）。
+
+        时间归一化在这里完成：模型只摘录原文时间表述（time_text/time_role），
+        governance_time 做确定性解析，填入双时态世界轴字段；解析失败保持为空。
+        """
         fact_inputs = []
         for index, relation in enumerate(normalized_result.get("relations") or []):
+            time_fields = normalize_time_expression(relation.get("time_text"), relation.get("time_role")) or {}
             fact_inputs.append(
                 {
                     "relation_index": index,
@@ -757,6 +764,10 @@ class MilvusGraphService:
                     "object_label": relation["target"].get("label") or "Entity",
                     "evidence_text": relation.get("text"),
                     "confidence": relation.get("confidence"),
+                    "valid_from": time_fields.get("valid_from"),
+                    "valid_from_precision": time_fields.get("valid_from_precision"),
+                    "valid_to": time_fields.get("valid_to"),
+                    "valid_to_precision": time_fields.get("valid_to_precision"),
                 }
             )
         return fact_inputs
@@ -794,29 +805,48 @@ class MilvusGraphService:
         file_id: str | None = None,
         page: int = 1,
         page_size: int = 20,
+        as_of: str | None = None,
+        subject: str | None = None,
     ) -> dict[str, Any]:
         await self._get_milvus_kb(kb_id)
+        as_of_dt: datetime | None = None
+        if as_of:
+            try:
+                as_of_dt = datetime.fromisoformat(as_of)
+            except ValueError as exc:
+                raise ValueError("as_of 必须是 ISO 8601 时间格式，如 2024-03-15 或 2024-03-15T00:00:00") from exc
+            if as_of_dt.tzinfo is None:
+                as_of_dt = as_of_dt.replace(tzinfo=UTC)
         return await self.fact_repo.list_facts(
             kb_id=kb_id,
             status=status,
             file_id=file_id,
             page=max(page, 1),
             page_size=min(max(page_size, 1), 100),
+            as_of=as_of_dt,
+            subject=subject,
         )
 
     async def decide_fact(self, kb_id: str, fact_id: str, *, decision: str, decided_by: str) -> dict[str, Any]:
-        """人审裁决一条事实；批准时立即把它投影进图谱。"""
+        """人审裁决一条事实；批准时立即把它投影进图谱，并应用纠正链。"""
         kb = await self._get_milvus_kb(kb_id)
         if decision not in {"approve", "reject"}:
             raise ValueError("decision 必须是 approve 或 reject")
-        fact, changed = await self.fact_repo.decide_fact(
+        fact, changed, superseded_count = await self.fact_repo.decide_fact(
             kb_id=kb_id, fact_id=fact_id, decision=decision, decided_by=decided_by
         )
         if fact is None:
             raise ValueError(f"事实不存在: {fact_id}")
         if changed and decision == "approve":
             await self._project_fact(kb, fact)
-        return KnowledgeFactRepository.serialize_fact(fact) | {"changed": changed}
+            if superseded_count:
+                logger.info(
+                    f"事实纠正链生效 kb_id={kb_id} fact_id={fact_id} superseded={superseded_count}"
+                )
+        return KnowledgeFactRepository.serialize_fact(fact) | {
+            "changed": changed,
+            "superseded_count": superseded_count,
+        }
 
     async def _project_fact(self, kb, fact) -> None:
         """把一条已批准的事实写入图谱（Neo4j + PG 三元组 + 图谱向量索引）。

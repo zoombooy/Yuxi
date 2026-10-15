@@ -15,9 +15,11 @@ from yuxi.knowledge.graphs.extractors.base import (
 )
 from yuxi.knowledge.graphs.milvus_graph_service import DEFAULT_AUTO_APPROVE_THRESHOLD, MilvusGraphService
 from yuxi.repositories import knowledge_fact_repository as fact_repo_module
+from yuxi.knowledge.graphs.governance_time import fact_holds_at, normalize_time_expression
 from yuxi.repositories.knowledge_fact_repository import (
     KnowledgeFactRepository,
     compute_fact_id,
+    find_supersede_candidates,
     merge_fact_decisions,
 )
 from yuxi.storage.postgres.models_knowledge import (
@@ -25,6 +27,7 @@ from yuxi.storage.postgres.models_knowledge import (
     KnowledgeGraphEntity,
     KnowledgeGraphTriple,
 )
+from datetime import UTC
 
 
 # ─── normalize_extraction_result 的 confidence 透传 ─────────────────
@@ -199,6 +202,9 @@ class FakeResult:
     def all(self):
         return self._rows
 
+    def scalars(self):
+        return self
+
     def scalar_one_or_none(self):
         return self._rows[0] if self._rows else None
 
@@ -278,11 +284,16 @@ async def test_enqueue_chunk_facts_skips_decided_relations(monkeypatch):
 )
 async def test_decide_fact_is_terminal_and_idempotent(monkeypatch, current_status, decision, expect_changed):
     fact = SimpleNamespace(
+        id=7,
         fact_id="f1",
         kb_id="kb",
         status=current_status,
         decided_at=None,
         decided_by=None,
+        subject_text="张三",
+        predicate="WORKS_AT",
+        object_text="公司",
+        recorded_at=None,
     )
     session = FakeSession(select_rows=[fact])
 
@@ -292,11 +303,12 @@ async def test_decide_fact_is_terminal_and_idempotent(monkeypatch, current_statu
 
     monkeypatch.setattr(fact_repo_module.pg_manager, "get_async_session_context", fake_session_context)
 
-    result, changed = await KnowledgeFactRepository().decide_fact(
+    result, changed, superseded = await KnowledgeFactRepository().decide_fact(
         kb_id="kb", fact_id="f1", decision=decision, decided_by="user-1"
     )
 
     assert changed is expect_changed
+    assert superseded == 0
     if expect_changed:
         assert result.status == ("approved" if decision == "approve" else "rejected")
         assert result.decided_by == "user-1"
@@ -314,11 +326,12 @@ async def test_decide_fact_missing_fact_returns_none(monkeypatch):
 
     monkeypatch.setattr(fact_repo_module.pg_manager, "get_async_session_context", fake_session_context)
 
-    result, changed = await KnowledgeFactRepository().decide_fact(
+    result, changed, superseded = await KnowledgeFactRepository().decide_fact(
         kb_id="kb", fact_id="missing", decision="approve", decided_by="user-1"
     )
     assert result is None
     assert changed is False
+    assert superseded == 0
 
 
 def test_serialize_fact_shapes_api_payload():
@@ -344,6 +357,7 @@ def test_serialize_fact_shapes_api_payload():
         valid_to_precision=None,
         recorded_at=None,
         invalidated_at=None,
+        supersedes_id=None,
         created_at=None,
     )
     payload = KnowledgeFactRepository.serialize_fact(fact)
@@ -351,3 +365,120 @@ def test_serialize_fact_shapes_api_payload():
     assert payload["confidence"] == 0.42
     assert payload["status"] == "pending"
     assert payload["recorded_at"] is None
+
+
+# ─── P2：时间归一化（世界轴） ────────────────────────────────────────
+
+
+def test_normalize_time_month_precision_start():
+    fields = normalize_time_expression("2023年3月", "start")
+    assert fields["valid_from"].year == 2023
+    assert fields["valid_from"].month == 3
+    assert fields["valid_from_precision"] == "month"
+    assert fields["valid_to"] is None
+    assert fields["valid_to_precision"] is None
+
+
+def test_normalize_time_day_precision_point():
+    fields = normalize_time_expression("2023年5月10日", "point")
+    assert fields["valid_from"].day == 10
+    assert fields["valid_from_precision"] == "day"
+
+
+def test_normalize_time_end_year_maps_to_period_end():
+    fields = normalize_time_expression("2022年", "end")
+    assert fields["valid_to"].year == 2022
+    assert fields["valid_to"].month == 12
+    assert fields["valid_to_precision"] == "year"
+    assert fields["valid_from"] is None
+
+
+def test_normalize_time_range_expression():
+    fields = normalize_time_expression("2020年至2023年", "point")
+    assert fields["valid_from"].year == 2020
+    assert fields["valid_to"].year == 2023
+    assert fields["valid_from_precision"] == "year"
+    assert fields["valid_to_precision"] == "year"
+
+
+def test_normalize_time_unknown_end():
+    fields = normalize_time_expression("已离职", "end")
+    assert fields["valid_to"] is None
+    assert fields["valid_to_precision"] == "unknown"
+
+
+def test_normalize_time_ongoing_stays_open():
+    fields = normalize_time_expression("2020年至今", "start")
+    assert fields["valid_from"].year == 2020
+    assert fields["valid_to"] is None
+
+
+def test_normalize_time_garbage_returns_none():
+    assert normalize_time_expression("没有时间信息", "point") is None
+    assert normalize_time_expression("", "start") is None
+    assert normalize_time_expression(None, "start") is None
+
+
+def test_normalize_time_invalid_month_returns_none():
+    assert normalize_time_expression("2023年13月", "start") is None
+
+
+def test_fact_holds_at_world_axis_judgement():
+    from datetime import datetime
+
+    def ts(text):
+        return datetime.fromisoformat(text).replace(tzinfo=UTC)
+
+    as_of = ts("2023-06-01T00:00:00")
+
+    ongoing = {"invalidated_at": None, "valid_from": None, "valid_to": None, "valid_to_precision": None}
+    assert fact_holds_at(ongoing, as_of) is True
+
+    ended = dict(ongoing, valid_to=ts("2022-12-31T23:59:59"), valid_to_precision="year")
+    assert fact_holds_at(ended, as_of) is False
+
+    not_yet = dict(ongoing, valid_from=ts("2023-07-01T00:00:00"))
+    assert fact_holds_at(not_yet, as_of) is False
+
+    unknown_end = dict(ongoing, valid_to=ts("2021-01-01T00:00:00"), valid_to_precision="unknown")
+    assert fact_holds_at(unknown_end, as_of) is True
+
+    superseded = dict(ongoing, invalidated_at=ts("2023-05-01T00:00:00"))
+    assert fact_holds_at(superseded, as_of) is False
+
+
+# ─── P2：纠正链（同 SPO 取代） ───────────────────────────────────────
+
+
+def _fact_ns(id, subject, predicate, object_text):
+    return SimpleNamespace(
+        id=id,
+        subject_text=subject,
+        predicate=predicate,
+        object_text=object_text,
+        recorded_at=None,
+        decided_at=None,
+    )
+
+
+def test_find_supersede_candidates_matches_same_statement():
+    new_fact = _fact_ns(2, "张三", "WORKS_AT", "公司")
+    candidates = find_supersede_candidates(
+        new_fact,
+        [_fact_ns(1, "张三 ", "WORKS_AT", "公司"), _fact_ns(3, "张三", "WORKS_AT", "其他公司")],
+    )
+    assert [item.id for item in candidates] == [1]
+
+
+def test_find_supersede_candidates_ignores_different_predicate_or_object():
+    new_fact = _fact_ns(2, "张三", "WORKS_AT", "公司")
+    candidates = find_supersede_candidates(
+        new_fact,
+        [_fact_ns(1, "张三", "LIVES_IN", "公司"), _fact_ns(3, "李四", "WORKS_AT", "公司")],
+    )
+    assert candidates == []
+
+
+def test_find_supersede_candidates_excludes_itself():
+    new_fact = _fact_ns(2, "张三", "WORKS_AT", "公司")
+    assert find_supersede_candidates(new_fact, [new_fact]) == []
