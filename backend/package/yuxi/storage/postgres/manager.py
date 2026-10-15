@@ -24,7 +24,7 @@ from yuxi.utils.singleton import SingletonMeta
 
 AGENT_RUN_TERMINAL_STATUS_SQL = ", ".join(f"'{status}'" for status in AGENT_RUN_TERMINAL_STATUSES)
 BUSINESS_SCHEMA_VERSION = 9
-KNOWLEDGE_SCHEMA_VERSION = 2
+KNOWLEDGE_SCHEMA_VERSION = 3
 SCHEMA_VERSION_TABLE = "yuxi_schema_migrations"
 AGENT_RUN_LEASE_SCHEMA_STATEMENTS = (
     "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS worker_id VARCHAR(128)",
@@ -252,6 +252,43 @@ KNOWLEDGE_FILE_TASK_OWNER_SCHEMA_STATEMENTS = (
     WHERE status IN ('parsing', 'indexing')
       AND processing_task_id IS NULL
     """,
+)
+# v2→v3：治理型知识事实表（双时态 + 审核队列）。fresh 安装由 create_all 建表，
+# 这里负责从 v2 升级的老库。列定义必须与 models_knowledge.KnowledgeFact 保持一致。
+KNOWLEDGE_FACTS_SCHEMA_STATEMENTS = (
+    """
+    CREATE TABLE IF NOT EXISTS knowledge_facts (
+        id SERIAL PRIMARY KEY,
+        fact_id VARCHAR(64) NOT NULL UNIQUE,
+        kb_id VARCHAR(80) NOT NULL REFERENCES knowledge_bases(kb_id) ON DELETE CASCADE,
+        file_id VARCHAR(64) NOT NULL REFERENCES knowledge_files(file_id) ON DELETE CASCADE,
+        chunk_id VARCHAR(128) NOT NULL REFERENCES knowledge_chunks(chunk_id) ON DELETE CASCADE,
+        relation_index INTEGER NOT NULL,
+        subject_text VARCHAR(512) NOT NULL,
+        subject_label VARCHAR(128) NOT NULL DEFAULT 'Entity',
+        predicate VARCHAR(256) NOT NULL,
+        object_text VARCHAR(512) NOT NULL,
+        object_label VARCHAR(128) NOT NULL DEFAULT 'Entity',
+        evidence_text TEXT,
+        confidence DOUBLE PRECISION,
+        status VARCHAR(16) NOT NULL DEFAULT 'pending',
+        decided_at TIMESTAMPTZ,
+        decided_by VARCHAR(64),
+        valid_from TIMESTAMPTZ,
+        valid_from_precision VARCHAR(16),
+        valid_to TIMESTAMPTZ,
+        valid_to_precision VARCHAR(16),
+        recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        invalidated_at TIMESTAMPTZ,
+        supersedes_id INTEGER REFERENCES knowledge_facts(id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        CONSTRAINT uq_knowledge_facts_chunk_relation UNIQUE (kb_id, chunk_id, relation_index)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_knowledge_facts_kb_status ON knowledge_facts(kb_id, status)",
+    "CREATE INDEX IF NOT EXISTS ix_knowledge_facts_kb_file_status ON knowledge_facts(kb_id, file_id, status)",
+    "CREATE INDEX IF NOT EXISTS ix_knowledge_facts_status ON knowledge_facts(status)",
 )
 TASK_DURABLE_SCHEMA_STATEMENTS = (
     "ALTER TABLE IF EXISTS tasks ADD COLUMN IF NOT EXISTS handler_version INTEGER",
@@ -566,6 +603,13 @@ class PostgresManager(metaclass=SingletonMeta):
             for statement in KNOWLEDGE_FILE_TASK_OWNER_SCHEMA_STATEMENTS:
                 await conn.execute(text(statement))
 
+    async def upgrade_knowledge_schema_v2_to_v3(self) -> None:
+        """新增治理型知识事实表（双时态 + 审核队列）。"""
+        self._check_initialized()
+        async with self.async_engine.begin() as conn:
+            for statement in KNOWLEDGE_FACTS_SCHEMA_STATEMENTS:
+                await conn.execute(text(statement))
+
     async def drop_tables(self):
         """删除所有表（慎用！）"""
         self._check_initialized()
@@ -816,6 +860,7 @@ class PostgresManager(metaclass=SingletonMeta):
                 CONSTRAINT uq_knowledge_graph_triple_mentions_triple_chunk UNIQUE (triple_id, chunk_id)
             )
             """,
+            *KNOWLEDGE_FACTS_SCHEMA_STATEMENTS,
             "ALTER TABLE IF EXISTS knowledge_bases ALTER COLUMN kb_id TYPE VARCHAR(80)",
             "ALTER TABLE IF EXISTS knowledge_graph_entities ADD COLUMN IF NOT EXISTS vector_status VARCHAR(16)",
             (

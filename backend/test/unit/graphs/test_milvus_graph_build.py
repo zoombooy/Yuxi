@@ -1016,7 +1016,14 @@ async def test_milvus_graph_service_configure_persists_updated_concurrency():
             return_value={"pending": 0, "processing": 0, "indexed": 5, "failed": 0}
         ),
     )
-    service = MilvusGraphService(kb_repo=Repo(), chunk_repo=chunk_repo, graph_repo=graph_repo)
+    service = MilvusGraphService(
+        kb_repo=Repo(),
+        chunk_repo=chunk_repo,
+        graph_repo=graph_repo,
+        fact_repo=SimpleNamespace(
+            count_facts_by_status=AsyncMock(return_value={"pending": 2, "approved": 0, "rejected": 0})
+        ),
+    )
 
     await service.configure(
         "kb_test",
@@ -1066,7 +1073,14 @@ async def test_graph_status_reports_latest_successful_run_as_completed():
             return_value={"pending": 0, "processing": 0, "indexed": 5, "failed": 0}
         ),
     )
-    service = MilvusGraphService(kb_repo=Repo(), chunk_repo=chunk_repo, graph_repo=graph_repo)
+    service = MilvusGraphService(
+        kb_repo=Repo(),
+        chunk_repo=chunk_repo,
+        graph_repo=graph_repo,
+        fact_repo=SimpleNamespace(
+            count_facts_by_status=AsyncMock(return_value={"pending": 2, "approved": 0, "rejected": 0})
+        ),
+    )
 
     status = await service.get_status("kb_test", tasker=Tasker())
 

@@ -17,10 +17,12 @@ JSON 格式：
       "source": {"text": "实体文本", "label": "实体类型", "attributes": [{"text": "属性值", "label": "属性名称"}]},
       "target": {"text": "实体文本", "label": "实体类型", "attributes": [{"text": "属性值", "label": "属性名称"}]},
       "text": "关系显示文本",
-      "label": "关系类型"
+      "label": "关系类型",
+      "confidence": 0.0
     }
   ]
 }
+confidence 是可选字段：这条关系在原文中有明确依据给接近 1.0，属于推断或原文表述模糊则给低分。
 """
 
 SCHEMA_INSTRUCTION = """抽取 Schema 约束：

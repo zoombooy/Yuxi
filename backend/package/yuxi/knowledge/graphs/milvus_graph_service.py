@@ -19,6 +19,7 @@ from yuxi.knowledge.graphs.graph_utils import (
 from yuxi.knowledge.graphs.milvus_graph_vector_store import MilvusGraphVectorStore
 from yuxi.repositories.knowledge_base_repository import KnowledgeBaseRepository
 from yuxi.repositories.knowledge_chunk_repository import KnowledgeChunkRepository
+from yuxi.repositories.knowledge_fact_repository import KnowledgeFactRepository
 from yuxi.repositories.knowledge_graph_repository import KnowledgeGraphRepository
 from yuxi.storage.neo4j import (
     Neo4jConnectionManager,
@@ -31,7 +32,9 @@ from yuxi.utils import logger
 from yuxi.utils.datetime_utils import utc_isoformat
 
 GRAPH_CONFIG_KEY = "graph_build_config"
+GOVERNANCE_CONFIG_KEY = "governance_config"
 GRAPH_TASK_TYPE = "knowledge_graph_index"
+DEFAULT_AUTO_APPROVE_THRESHOLD = 0.8
 NEO4J_QUERY_OFFLOAD_LIMIT = 8
 # 数据库游标每次预取的 chunk 数量边界，只控制查询频率和单页内存，不限制 LLM 并发。
 # 实际 LLM 并发只由 extractor_options.concurrency_count 决定；预取量会按其两倍动态计算后落在此范围内。
@@ -94,6 +97,7 @@ class MilvusGraphService:
         kb_repo: KnowledgeBaseRepository | None = None,
         chunk_repo: KnowledgeChunkRepository | None = None,
         graph_repo: KnowledgeGraphRepository | None = None,
+        fact_repo: KnowledgeFactRepository | None = None,
         graph_vector_store: MilvusGraphVectorStore | None = None,
         neo4j_connection: Neo4jConnectionManager | None = None,
     ):
@@ -101,6 +105,7 @@ class MilvusGraphService:
         self.kb_repo = kb_repo or KnowledgeBaseRepository()
         self.chunk_repo = chunk_repo or KnowledgeChunkRepository()
         self.graph_repo = graph_repo or KnowledgeGraphRepository()
+        self.fact_repo = fact_repo or KnowledgeFactRepository()
         self._graph_vector_store = graph_vector_store
         self._graph_vector_store_lock = asyncio.Lock()
         self._connection = neo4j_connection
@@ -141,6 +146,7 @@ class MilvusGraphService:
             self.chunk_repo.count_graph_extraction_statuses_by_kb_id(kb_id),
             self.graph_repo.count_by_kb_id(kb_id),
             self.graph_repo.count_vector_statuses_by_kb_id(kb_id),
+            self.fact_repo.count_facts_by_status(kb_id),
         )
         (
             total_chunks,
@@ -150,6 +156,7 @@ class MilvusGraphService:
             extraction_counts,
             graph_counts,
             vector_counts,
+            fact_counts,
         ) = status_values
         entity_count, relationship_count = graph_counts
 
@@ -176,6 +183,8 @@ class MilvusGraphService:
             "configured": bool(config),
             "locked": bool(config.get("locked")),
             "config": self._public_config(config),
+            "governance": self.get_governance_config(kb),
+            "fact_counts": fact_counts,
             "total_chunks": total_chunks,
             "pending_chunks": pending_chunks,
             "indexed_chunks": indexed_chunks,
@@ -227,11 +236,60 @@ class MilvusGraphService:
         samples = await self.chunk_repo.list_graph_extraction_failed_samples(kb_id, limit)
         return {"kb_id": kb_id, "samples": samples}
 
+    @staticmethod
+    def get_governance_config(kb) -> dict[str, Any]:
+        """读取知识库的治理配置。未配置时治理关闭——治理层必须是可选增量，不影响快速 RAG 链路。"""
+        config = (kb.additional_params or {}).get(GOVERNANCE_CONFIG_KEY) or {}
+        threshold = config.get("auto_approve_threshold")
+        try:
+            threshold = float(threshold) if threshold is not None else DEFAULT_AUTO_APPROVE_THRESHOLD
+        except (TypeError, ValueError):
+            threshold = DEFAULT_AUTO_APPROVE_THRESHOLD
+        return {
+            "enabled": bool(config.get("enabled")),
+            "auto_approve_threshold": min(max(threshold, 0.0), 1.0),
+        }
+
+    async def get_governance(self, kb_id: str) -> dict[str, Any]:
+        kb = await self._get_milvus_kb(kb_id)
+        return self.get_governance_config(kb)
+
+    async def configure_governance(
+        self,
+        kb_id: str,
+        *,
+        enabled: bool,
+        auto_approve_threshold: float | None,
+        updated_by: str,
+    ) -> dict[str, Any]:
+        kb = await self._get_milvus_kb(kb_id)
+        if auto_approve_threshold is not None:
+            try:
+                auto_approve_threshold = float(auto_approve_threshold)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("auto_approve_threshold 必须是 0 到 1 之间的数字") from exc
+            if not 0.0 <= auto_approve_threshold <= 1.0:
+                raise ValueError("auto_approve_threshold 必须是 0 到 1 之间的数字")
+        additional_params = dict(kb.additional_params or {})
+        config = {
+            "enabled": bool(enabled),
+            "auto_approve_threshold": auto_approve_threshold,
+            "updated_at": utc_isoformat(),
+            "updated_by": updated_by,
+        }
+        additional_params[GOVERNANCE_CONFIG_KEY] = config
+        await self.kb_repo.update(kb_id, {"additional_params": additional_params})
+        return self.get_governance_config(kb) | {"updated_at": config["updated_at"], "updated_by": updated_by}
+
     async def build_pending_chunks(self, kb_id: str, *, context=None) -> dict[str, Any]:
         kb = await self._get_milvus_kb(kb_id)
         config = self._get_locked_config(kb.additional_params or {})
         extractor_options = self._runtime_extractor_options(config)
         extractor = GraphExtractorFactory.create(config["extractor_type"], extractor_options)
+        governance = self.get_governance_config(kb)
+        governance_enabled = bool(governance.get("enabled"))
+        auto_approve_threshold = governance.get("auto_approve_threshold")
+        pending_facts_total = 0
         worker_count = self._get_worker_count(config)
         total_pending = await self.chunk_repo.count_graph_pending_by_kb_id(kb_id)
         initially_indexed = await self.chunk_repo.count_graph_indexed_by_kb_id(kb_id)
@@ -294,7 +352,7 @@ class MilvusGraphService:
                     extraction_queue.task_done()
 
         async def write_worker() -> None:
-            nonlocal processed, write_failed, write_completed
+            nonlocal processed, write_failed, write_completed, pending_facts_total
             while True:
                 chunk_id = await write_queue.get()
                 try:
@@ -307,19 +365,35 @@ class MilvusGraphService:
                         raise ValueError(f"图谱写入找不到 chunk: {chunk_id}")
                     extraction_result = await self._get_chunk_extraction_result(kb_id, chunk, extractor)
                     write_started_at = time.monotonic()
-                    entities, triples = await asyncio.to_thread(
-                        self.write_chunk_graph,
-                        kb_id,
-                        chunk,
-                        extraction_result,
-                    )
-                    await self.graph_repo.upsert_chunk_graph(
-                        kb_id=kb_id,
-                        file_id=chunk.file_id,
-                        chunk_id=chunk.chunk_id,
-                        entities=entities,
-                        triples=triples,
-                    )
+                    entities: list[dict[str, Any]] = []
+                    triples: list[dict[str, Any]] = []
+                    if governance_enabled:
+                        # 治理开启：抽取结果先进事实审核队列，只有已批准（含自动批准）
+                        # 的关系才投影到图谱；未裁决的事实留在队列里等人审。
+                        approved_indexes = await self.fact_repo.enqueue_chunk_facts(
+                            kb_id=kb_id,
+                            file_id=chunk.file_id,
+                            chunk_id=chunk.chunk_id,
+                            fact_inputs=self._build_fact_inputs(extraction_result),
+                            auto_approve_threshold=auto_approve_threshold,
+                        )
+                        total_relations = len(extraction_result.get("relations") or [])
+                        pending_facts_total += max(total_relations - len(approved_indexes), 0)
+                        extraction_result = self._filter_extraction_result(extraction_result, approved_indexes)
+                    if extraction_result["relations"]:
+                        entities, triples = await asyncio.to_thread(
+                            self.write_chunk_graph,
+                            kb_id,
+                            chunk,
+                            extraction_result,
+                        )
+                        await self.graph_repo.upsert_chunk_graph(
+                            kb_id=kb_id,
+                            file_id=chunk.file_id,
+                            chunk_id=chunk.chunk_id,
+                            entities=entities,
+                            triples=triples,
+                        )
                     await self.chunk_repo.mark_graph_structure_indexed(
                         chunk.chunk_id,
                         ent_ids=[entity["entity_id"] for entity in entities],
@@ -340,45 +414,7 @@ class MilvusGraphService:
                     write_queue.task_done()
 
         async def index_vector_batch(record_type: str) -> int:
-            lock_token, records = await self.graph_repo.claim_vector_records(
-                kb_id=kb_id,
-                record_type=record_type,
-                limit=GRAPH_VECTOR_BATCH_SIZE,
-                lease_seconds=GRAPH_VECTOR_LEASE_SECONDS,
-            )
-            if not records:
-                return 0
-            record_ids = [record["id"] for record in records]
-            try:
-                graph_vector_store = await self.get_graph_vector_store()
-                await graph_vector_store.upsert_graph_records(
-                    kb_id=kb_id,
-                    embedding_model_spec=kb.embedding_model_spec,
-                    record_type=record_type,
-                    records=records,
-                )
-                await self.graph_repo.mark_vector_records_indexed(
-                    record_type=record_type,
-                    record_ids=record_ids,
-                    lock_token=lock_token,
-                )
-            except asyncio.CancelledError as exc:
-                await self.graph_repo.mark_vector_records_failed(
-                    record_type=record_type,
-                    record_ids=record_ids,
-                    lock_token=lock_token,
-                    error=str(exc) or "cancelled",
-                )
-                raise
-            except Exception as exc:
-                await self.graph_repo.mark_vector_records_failed(
-                    record_type=record_type,
-                    record_ids=record_ids,
-                    lock_token=lock_token,
-                    error=str(exc),
-                )
-                logger.error(f"图谱向量索引失败 kb_id={kb_id} type={record_type} count={len(records)}: {exc}")
-            return len(records)
+            return await self._index_vector_batch(kb_id, kb, record_type)
 
         async def vector_worker() -> None:
             while True:
@@ -489,6 +525,7 @@ class MilvusGraphService:
         logger.info(
             f"图谱构建结束 kb_id={kb_id} success={processed} extraction_failed={extraction_failed} "
             f"write_failed={write_failed} remaining={remaining} "
+            f"pending_facts={pending_facts_total} "
             f"duration={time.monotonic() - started_at:.2f}s"
         )
         incomplete = max(remaining - extraction_counts["failed"], 0)
@@ -703,10 +740,174 @@ class MilvusGraphService:
             )
         return records
 
+    # ─── 知识治理：事实审核队列 ──────────────────────────────────────
+
+    @staticmethod
+    def _build_fact_inputs(normalized_result: dict[str, Any]) -> list[dict[str, Any]]:
+        """把标准化抽取结果映射成事实队列的入参（顺序即 relation_index）。"""
+        fact_inputs = []
+        for index, relation in enumerate(normalized_result.get("relations") or []):
+            fact_inputs.append(
+                {
+                    "relation_index": index,
+                    "subject_text": relation["source"]["text"],
+                    "subject_label": relation["source"].get("label") or "Entity",
+                    "predicate": relation.get("label") or "RELATED_TO",
+                    "object_text": relation["target"]["text"],
+                    "object_label": relation["target"].get("label") or "Entity",
+                    "evidence_text": relation.get("text"),
+                    "confidence": relation.get("confidence"),
+                }
+            )
+        return fact_inputs
+
+    @staticmethod
+    def _filter_extraction_result(
+        normalized_result: dict[str, Any],
+        approved_indexes: set[int],
+    ) -> dict[str, Any]:
+        """只保留已批准的关系，并剪掉不再被任何批准关系引用的实体。"""
+        relations = [
+            relation
+            for index, relation in enumerate(normalized_result.get("relations") or [])
+            if index in approved_indexes
+        ]
+        entities = []
+        seen_keys: set[tuple[str, str]] = set()
+        for relation in relations:
+            for endpoint in (relation["source"], relation["target"]):
+                key = (normalize_entity_name(endpoint["text"]), endpoint.get("label") or "Entity")
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    entities.append(endpoint)
+        return {
+            "entities": entities,
+            "relations": relations,
+            "metadata": normalized_result.get("metadata") or {},
+        }
+
+    async def list_facts(
+        self,
+        kb_id: str,
+        *,
+        status: str | None = None,
+        file_id: str | None = None,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> dict[str, Any]:
+        await self._get_milvus_kb(kb_id)
+        return await self.fact_repo.list_facts(
+            kb_id=kb_id,
+            status=status,
+            file_id=file_id,
+            page=max(page, 1),
+            page_size=min(max(page_size, 1), 100),
+        )
+
+    async def decide_fact(self, kb_id: str, fact_id: str, *, decision: str, decided_by: str) -> dict[str, Any]:
+        """人审裁决一条事实；批准时立即把它投影进图谱。"""
+        kb = await self._get_milvus_kb(kb_id)
+        if decision not in {"approve", "reject"}:
+            raise ValueError("decision 必须是 approve 或 reject")
+        fact, changed = await self.fact_repo.decide_fact(
+            kb_id=kb_id, fact_id=fact_id, decision=decision, decided_by=decided_by
+        )
+        if fact is None:
+            raise ValueError(f"事实不存在: {fact_id}")
+        if changed and decision == "approve":
+            await self._project_fact(kb, fact)
+        return KnowledgeFactRepository.serialize_fact(fact) | {"changed": changed}
+
+    async def _project_fact(self, kb, fact) -> None:
+        """把一条已批准的事实写入图谱（Neo4j + PG 三元组 + 图谱向量索引）。
+
+        复用 write_chunk_graph 的 MERGE 全套逻辑，只是把抽取结果裁剪成这一条关系；
+        chunk 节点不存在（治理开启后从未投影过）也会被顺带 MERGE 出来。
+        """
+        chunk = await self.chunk_repo.get_by_chunk_id(fact.chunk_id)
+        if chunk is None:
+            logger.warning(f"事实投影跳过（chunk 已删除） kb_id={fact.kb_id} fact_id={fact.fact_id}")
+            return
+        mini_result = {
+            "entities": [],
+            "relations": [
+                {
+                    "source": {
+                        "text": fact.subject_text,
+                        "label": fact.subject_label,
+                        "attributes": [],
+                    },
+                    "target": {
+                        "text": fact.object_text,
+                        "label": fact.object_label,
+                        "attributes": [],
+                    },
+                    "text": fact.evidence_text or fact.predicate,
+                    "label": fact.predicate,
+                }
+            ],
+            "metadata": {"extractor_type": "governed_fact"},
+        }
+        entities, triples = await asyncio.to_thread(self.write_chunk_graph, fact.kb_id, chunk, mini_result)
+        await self.graph_repo.upsert_chunk_graph(
+            kb_id=fact.kb_id,
+            file_id=fact.file_id,
+            chunk_id=fact.chunk_id,
+            entities=entities,
+            triples=triples,
+        )
+        await asyncio.gather(
+            self._index_vector_batch(fact.kb_id, kb, "entity"),
+            self._index_vector_batch(fact.kb_id, kb, "triple"),
+        )
+        await self.graph_repo.finalize_graph_indexed_chunks(fact.kb_id)
+
+    async def _index_vector_batch(self, kb_id: str, kb, record_type: str) -> int:
+        lock_token, records = await self.graph_repo.claim_vector_records(
+            kb_id=kb_id,
+            record_type=record_type,
+            limit=GRAPH_VECTOR_BATCH_SIZE,
+            lease_seconds=GRAPH_VECTOR_LEASE_SECONDS,
+        )
+        if not records:
+            return 0
+        record_ids = [record["id"] for record in records]
+        try:
+            graph_vector_store = await self.get_graph_vector_store()
+            await graph_vector_store.upsert_graph_records(
+                kb_id=kb_id,
+                embedding_model_spec=kb.embedding_model_spec,
+                record_type=record_type,
+                records=records,
+            )
+            await self.graph_repo.mark_vector_records_indexed(
+                record_type=record_type,
+                record_ids=record_ids,
+                lock_token=lock_token,
+            )
+        except asyncio.CancelledError as exc:
+            await self.graph_repo.mark_vector_records_failed(
+                record_type=record_type,
+                record_ids=record_ids,
+                lock_token=lock_token,
+                error=str(exc) or "cancelled",
+            )
+            raise
+        except Exception as exc:
+            await self.graph_repo.mark_vector_records_failed(
+                record_type=record_type,
+                record_ids=record_ids,
+                lock_token=lock_token,
+                error=str(exc),
+            )
+            logger.error(f"图谱向量索引失败 kb_id={kb_id} type={record_type} count={len(records)}: {exc}")
+        return len(records)
+
     async def reset(self, kb_id: str, *, clear_extraction_result: bool, clear_config: bool) -> dict[str, Any]:
         kb = await self._get_milvus_kb(kb_id)
         await asyncio.to_thread(self.delete_graph, kb_id)
         await self.graph_repo.delete_by_kb_id(kb_id)
+        reset_facts = await self.fact_repo.delete_by_kb_id(kb_id)
         reset_chunks = await self.chunk_repo.reset_graph_state_by_kb_id(kb_id, clear_extraction_result)
         if clear_config:
             additional_params = dict(kb.additional_params or {})
@@ -716,6 +917,7 @@ class MilvusGraphService:
             "message": "图谱构建状态已重置",
             "status": "success",
             "reset_chunks": reset_chunks,
+            "reset_facts": reset_facts,
             "clear_extraction_result": clear_extraction_result,
             "clear_config": clear_config,
         }

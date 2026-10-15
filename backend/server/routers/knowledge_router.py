@@ -607,6 +607,105 @@ async def reconcile_graph_build(
         raise HTTPException(status_code=500, detail=f"提交图谱向量索引修复任务失败: {e}")
 
 
+class GovernanceConfigRequest(BaseModel):
+    enabled: bool
+    auto_approve_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
+class FactDecisionRequest(BaseModel):
+    decision: str = Field(pattern="^(approve|reject)$")
+
+
+@knowledge.get("/databases/{kb_id}/governance/config")
+async def get_governance_config(kb_id: str, current_user: User = Depends(require_knowledge_base_read)):
+    try:
+        config = await MilvusGraphService().get_governance(kb_id)
+        return {"kb_id": kb_id, "config": config}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取知识治理配置失败 {e}, {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"获取知识治理配置失败: {e}")
+
+
+@knowledge.put("/databases/{kb_id}/governance/config")
+async def update_governance_config(
+    kb_id: str,
+    data: GovernanceConfigRequest,
+    current_user: User = Depends(require_knowledge_base_manage),
+):
+    try:
+        config = await MilvusGraphService().configure_governance(
+            kb_id,
+            enabled=data.enabled,
+            auto_approve_threshold=data.auto_approve_threshold,
+            updated_by=current_user.uid,
+        )
+        return {"message": "知识治理配置已更新", "status": "success", "config": config}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"更新知识治理配置失败 {e}, {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"更新知识治理配置失败: {e}")
+
+
+@knowledge.get("/databases/{kb_id}/governance/facts")
+async def list_governance_facts(
+    kb_id: str,
+    status: str | None = Query(None),
+    file_id: str | None = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    current_user: User = Depends(require_knowledge_base_read),
+):
+    if status is not None and status not in {"pending", "approved", "rejected"}:
+        raise HTTPException(status_code=400, detail="status 必须是 pending、approved 或 rejected")
+    try:
+        return await MilvusGraphService().list_facts(
+            kb_id,
+            status=status,
+            file_id=file_id,
+            page=page,
+            page_size=page_size,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取知识事实列表失败 {e}, {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"获取知识事实列表失败: {e}")
+
+
+@knowledge.post("/databases/{kb_id}/governance/facts/{fact_id}/decision")
+async def decide_governance_fact(
+    kb_id: str,
+    fact_id: str,
+    data: FactDecisionRequest,
+    current_user: User = Depends(require_knowledge_base_manage),
+):
+    try:
+        fact = await MilvusGraphService().decide_fact(
+            kb_id,
+            fact_id,
+            decision=data.decision,
+            decided_by=current_user.uid,
+        )
+        message = "事实已批准并写入图谱" if data.decision == "approve" else "事实已驳回"
+        return {"message": message, "status": "success", "fact": fact}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"裁决知识事实失败 {e}, {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"裁决知识事实失败: {e}")
+
+
 @knowledge.get("/databases/{kb_id}/export")
 async def export_database(
     kb_id: str,

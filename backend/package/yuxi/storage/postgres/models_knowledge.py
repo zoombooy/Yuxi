@@ -215,6 +215,58 @@ class KnowledgeGraphTripleMention(Base):
     created_at = Column(DateTime(timezone=True), default=utc_now)
 
 
+class KnowledgeFact(Base):
+    """治理型知识事实（双时态）。
+
+    双时态设计（借鉴 utopia）：
+    - 世界轴：valid_from / valid_to（原文断言的时间），精度列描述"没量过"与"量到日"
+      的区别；valid_to 为空且 precision='unknown' 表示"结束了但不知哪天"。
+    - 认知轴：recorded_at / invalidated_at（系统何时开始/停止相信这条事实）。
+
+    纠正一条事实是新版本 supersedes 旧版本，不 UPDATE 覆盖（P1 仅建列，
+    版本链与实体消解在后续治理阶段启用）。
+    """
+
+    __tablename__ = "knowledge_facts"
+    __table_args__ = (
+        UniqueConstraint("kb_id", "chunk_id", "relation_index", name="uq_knowledge_facts_chunk_relation"),
+        UniqueConstraint("fact_id", name="uq_knowledge_facts_fact_id"),
+        Index("ix_knowledge_facts_kb_status", "kb_id", "status"),
+        Index("ix_knowledge_facts_kb_file_status", "kb_id", "file_id", "status"),
+    )
+
+    # 审核状态机的终态语义：只有 pending 可以被裁决，approved/rejected 是终态。
+    STATUS_PENDING = "pending"
+    STATUS_APPROVED = "approved"
+    STATUS_REJECTED = "rejected"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    fact_id = Column(String(64), nullable=False)
+    kb_id = Column(String(80), ForeignKey("knowledge_bases.kb_id", ondelete="CASCADE"), nullable=False)
+    file_id = Column(String(64), ForeignKey("knowledge_files.file_id", ondelete="CASCADE"), nullable=False)
+    chunk_id = Column(String(128), ForeignKey("knowledge_chunks.chunk_id", ondelete="CASCADE"), nullable=False)
+    relation_index = Column(Integer, nullable=False)
+    subject_text = Column(String(512), nullable=False)
+    subject_label = Column(String(128), nullable=False, default="Entity")
+    predicate = Column(String(256), nullable=False)
+    object_text = Column(String(512), nullable=False)
+    object_label = Column(String(128), nullable=False, default="Entity")
+    evidence_text = Column(Text)
+    confidence = Column(Float)
+    status = Column(String(16), nullable=False, default="pending", index=True)
+    decided_at = Column(DateTime(timezone=True))
+    decided_by = Column(String(64))
+    valid_from = Column(DateTime(timezone=True))
+    valid_from_precision = Column(String(16))
+    valid_to = Column(DateTime(timezone=True))
+    valid_to_precision = Column(String(16))
+    recorded_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    invalidated_at = Column(DateTime(timezone=True))
+    supersedes_id = Column(Integer, ForeignKey("knowledge_facts.id", ondelete="SET NULL"))
+    created_at = Column(DateTime(timezone=True), default=utc_now)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
 class EvaluationDataset(Base):
     """评估数据集模型"""
 

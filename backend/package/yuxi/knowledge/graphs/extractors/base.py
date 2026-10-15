@@ -117,6 +117,9 @@ def normalize_extraction_result(result: dict[str, Any], extractor_type: str) -> 
                 "target": target,
                 "text": text,
                 "label": label,
+                # 模型自评置信度（0~1）。治理层用它决定是否需要人审；无治理时被
+                # 下游写图路径忽略。非法值一律归 None（"模型没给"与"给了垃圾"同权）。
+                "confidence": _normalize_confidence(relation.get("confidence")),
             }
         )
 
@@ -159,6 +162,18 @@ def _normalize_relation_endpoint(
             f"未找到: {path}={endpoint_ref}, Result: {result}"
         )
     return entity
+
+
+def _normalize_confidence(value: Any) -> float | None:
+    """把模型给出的 confidence 收敛到 [0, 1]，给不出合法值就是 None。"""
+    if isinstance(value, bool) or value is None:
+        return None
+    if not isinstance(value, int | float):
+        return None
+    confidence = float(value)
+    if confidence != confidence or confidence in (float("inf"), float("-inf")):
+        return None
+    return min(max(confidence, 0.0), 1.0)
 
 
 def _normalize_entity(entity: Any, path: str) -> dict[str, Any]:
