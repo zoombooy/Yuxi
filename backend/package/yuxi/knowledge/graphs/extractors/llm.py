@@ -87,12 +87,24 @@ class LLMGraphExtractor(GraphExtractor):
                 '例如 {"extra_body": {"enable_thinking": false}}'
             )
 
+    @staticmethod
+    def _resolve_model_params(model_params: dict[str, Any] | None) -> dict[str, Any]:
+        """合并默认请求参数。
+
+        qwen3 系模型在 DashScope 兼容模式下默认开启思考，结构化抽取任务会陷入
+        数分钟的长思考、非流式调用迟迟无响应（生产中三次超时整库构建失败），
+        故默认在 extra_body 中关闭思考；用户显式配置的 extra_body 优先，不覆盖。
+        """
+        merged = dict(model_params or {})
+        merged.setdefault("extra_body", {"enable_thinking": False})
+        return merged
+
     async def extract(self, text: str, *, chunk_metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         self.validate_options()
         model = select_model(
             model_spec=self.options["model_spec"],
             timeout=self._resolve_timeout_seconds(),
-            model_params=self.options.get("model_params") or {},
+            model_params=self._resolve_model_params(self.options.get("model_params")),
         )
         prompt = self._build_prompt(text)
         response = await model.call(prompt, stream=False)

@@ -482,3 +482,25 @@ def test_find_supersede_candidates_ignores_different_predicate_or_object():
 def test_find_supersede_candidates_excludes_itself():
     new_fact = _fact_ns(2, "张三", "WORKS_AT", "公司")
     assert find_supersede_candidates(new_fact, [new_fact]) == []
+
+
+# ─── P2：抽取默认关闭思考模式 ────────────────────────────────────────
+
+
+def test_resolve_model_params_defaults_to_no_thinking():
+    from yuxi.knowledge.graphs.extractors.llm import LLMGraphExtractor
+
+    merged = LLMGraphExtractor._resolve_model_params(None)
+    assert merged["extra_body"] == {"enable_thinking": False}
+
+    merged = LLMGraphExtractor._resolve_model_params({})
+    assert merged["extra_body"] == {"enable_thinking": False}
+
+
+def test_resolve_model_params_keeps_user_extra_body():
+    from yuxi.knowledge.graphs.extractors.llm import LLMGraphExtractor
+
+    user_params = {"extra_body": {"enable_thinking": True, "temperature": 0.2}}
+    merged = LLMGraphExtractor._resolve_model_params(user_params)
+    assert merged["extra_body"] == {"enable_thinking": True, "temperature": 0.2}
+    assert merged is not user_params
