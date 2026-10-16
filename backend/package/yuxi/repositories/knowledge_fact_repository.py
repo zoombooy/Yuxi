@@ -239,13 +239,18 @@ class KnowledgeFactRepository:
 
         - status: pending/approved/rejected；'invalidated' 已失效（approved 且被
           取代/推翻）；'all' 不过滤；
-        - as_of: 给定时点做世界轴判定——只返回该时点为真的已批准事实
-          （未被推翻、已生效、未终结；precision='unknown' 的结束端无法证伪，按成立处理）；
+        - as_of: 快照判定——返回 as_of 时点系统所信的已批准事实（双轴合并：
+          认知轴已入库且未被推翻 + 世界轴已生效未终结；precision='unknown'
+          的结束端无法证伪，按成立处理）；
         - subject: 按归一化主语过滤（历史/时间线查询入口）。
         """
         conditions = [KnowledgeFact.kb_id == kb_id]
         if as_of is not None:
+            # 快照语义（双轴合并判定）：as_of 时刻系统所信的状态——
+            # 已入库（认知轴：recorded_at <= as_of）、未被推翻（invalidated_at
+            # 为空或 > as_of）、且在世界轴上已生效未终结。
             conditions.append(KnowledgeFact.status == KnowledgeFact.STATUS_APPROVED)
+            conditions.append(KnowledgeFact.recorded_at <= as_of)
             conditions.append(or_(KnowledgeFact.invalidated_at.is_(None), KnowledgeFact.invalidated_at > as_of))
             conditions.append(or_(KnowledgeFact.valid_from.is_(None), KnowledgeFact.valid_from <= as_of))
             conditions.append(
