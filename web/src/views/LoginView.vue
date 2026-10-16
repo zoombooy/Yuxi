@@ -1,280 +1,167 @@
 <template>
-  <div class="login-view" :class="{ 'has-alert': serverStatus === 'error' }">
+  <div class="login-page">
+    <!-- 巨构变换背景（移植自 utopia LoginScene） -->
+    <LoginScene :leaving="leaving" />
+
     <!-- 服务状态提示 -->
-    <div v-if="serverStatus === 'error'" class="server-status-alert">
-      <div class="alert-content">
-        <exclamation-circle-icon class="alert-icon" size="20" />
-        <div class="alert-text">
-          <div class="alert-title">服务端连接失败</div>
-          <div class="alert-message">{{ serverError }}</div>
-        </div>
-        <a-button type="link" size="small" @click="checkServerHealth" :loading="healthChecking">
-          重试
-        </a-button>
+    <div v-if="serverStatus === 'error'" class="server-status-alert" role="alert">
+      <exclamation-circle-icon class="alert-icon" :size="18" />
+      <div class="alert-text">
+        <div class="alert-title">服务端连接失败</div>
+        <div class="alert-message">{{ serverError }}</div>
       </div>
+      <a-button type="link" size="small" :loading="healthChecking" @click="checkServerHealth">
+        重试
+      </a-button>
     </div>
 
-    <!-- 顶部导航：品牌名称 & 操作按钮 -->
-    <nav class="login-navbar">
-      <div class="navbar-content">
-        <div class="brand-container" @click="goHome" style="cursor: pointer">
-          <img v-if="brandLogo" :src="brandLogo" alt="logo" class="brand-logo" />
-          <h1 class="brand-text">
-            <span v-if="brandOrgName" class="brand-org">{{ brandOrgName }}</span>
-            <span v-if="brandOrgName && brandName !== brandOrgName" class="brand-separator"></span>
-            <span class="brand-main">{{ brandName }}</span>
-          </h1>
-        </div>
+    <div class="login-column" :class="{ 'is-leaving': leaving }">
+      <!-- 品牌区 -->
+      <div class="brand-hero u-rise">
+        <h1 class="brand-title">{{ brandName }}</h1>
+        <p class="brand-tagline">
+          {{ tagline }}
+          <span class="brand-tagline-source">{{ taglineSource }}</span>
+        </p>
       </div>
-    </nav>
 
-    <!-- 主要内容区：居中卡片 -->
-    <main class="login-main">
-      <div class="login-card">
-        <!-- 左侧图片 -->
-        <div class="card-side is-image">
-          <img :src="loginBgImage" alt="登录背景" class="login-bg-image" />
+      <!-- 登录卡片 -->
+      <div class="login-card u-rise" style="animation-delay: 90ms">
+        <div v-if="!isFirstRun" class="segmented" role="tablist">
+          <button
+            type="button"
+            role="tab"
+            class="segmented-item"
+            :class="{ active: mode === 'login' }"
+            :aria-selected="mode === 'login'"
+            @click="mode = 'login'"
+          >
+            登录
+          </button>
+          <button
+            type="button"
+            role="tab"
+            class="segmented-item"
+            :class="{ active: mode === 'register' }"
+            :aria-selected="mode === 'register'"
+            @click="mode = 'register'"
+          >
+            注册
+          </button>
         </div>
 
-        <!-- 右侧表单 -->
-        <div class="card-side is-form">
-          <div class="form-wrapper">
-            <header class="form-header">
-              <!-- 如果是在初始化，显示特定标题 -->
-              <h2 v-if="isFirstRun" class="init-title">系统初始化，请创建超级管理员</h2>
-              <p v-else class="welcome-text">欢迎登录</p>
-            </header>
+        <!-- 注册：未开放自助注册 -->
+        <div v-if="!isFirstRun && mode === 'register'" class="register-notice">
+          自助注册未开放，请联系管理员创建账号。
+        </div>
 
-            <div class="login-content" :class="{ 'is-initializing': isFirstRun }">
-              <!-- 初始化管理员表单 -->
-              <div v-if="isFirstRun" class="login-form login-form--init">
-                <a-form :model="adminForm" @finish="handleInitialize" layout="vertical">
-                  <a-form-item
-                    label="UID"
-                    name="uid"
-                    :rules="[
-                      { required: true, message: '请输入UID' },
-                      {
-                        pattern: /^[a-zA-Z0-9_]+$/,
-                        message: 'UID只能包含字母、数字和下划线'
-                      },
-                      {
-                        min: 3,
-                        max: 20,
-                        message: 'UID长度必须在3-20个字符之间'
-                      }
-                    ]"
-                  >
-                    <a-input
-                      v-model:value="adminForm.uid"
-                      placeholder="请输入UID（3-20个字符）"
-                      :maxlength="20"
-                    />
-                  </a-form-item>
+        <!-- 初始化管理员表单 -->
+        <form v-else-if="isFirstRun" class="login-form" @submit.prevent="handleInitialize">
+          <h2 class="init-title">系统初始化，请创建超级管理员</h2>
+          <label class="field-label" for="init-uid">UID</label>
+          <input
+            id="init-uid"
+            v-model="adminForm.uid"
+            class="field-input"
+            placeholder="请输入UID（3-20个字符）"
+            maxlength="20"
+            autocomplete="username"
+          />
+          <label class="field-label" for="init-phone">手机号（可选）</label>
+          <input
+            id="init-phone"
+            v-model="adminForm.phone_number"
+            class="field-input"
+            placeholder="可用于登录，可不填写"
+            maxlength="11"
+          />
+          <label class="field-label" for="init-password">密码</label>
+          <input
+            id="init-password"
+            v-model="adminForm.password"
+            type="password"
+            class="field-input"
+            placeholder="请输入密码"
+            :minlength="MIN_PASSWORD_LENGTH"
+            autocomplete="new-password"
+          />
+          <label class="field-label" for="init-confirm">确认密码</label>
+          <input
+            id="init-confirm"
+            v-model="adminForm.confirmPassword"
+            type="password"
+            class="field-input"
+            placeholder="请再次输入密码"
+            autocomplete="new-password"
+          />
+          <p v-if="errorMessage" class="form-error" role="alert">{{ errorMessage }}</p>
+          <button type="submit" class="primary-button" :disabled="loading">
+            {{ loading ? '创建中…' : '创建管理员账户' }}
+          </button>
+        </form>
 
-                  <a-form-item
-                    label="手机号（可选）"
-                    name="phone_number"
-                    :rules="[
-                      {
-                        validator: async (rule, value) => {
-                          if (!value || value.trim() === '') {
-                            return // 空值允许
-                          }
-                          const phoneRegex = /^1[3-9]\d{9}$/
-                          if (!phoneRegex.test(value)) {
-                            throw new Error('请输入正确的手机号格式')
-                          }
-                        }
-                      }
-                    ]"
-                  >
-                    <a-input
-                      v-model:value="adminForm.phone_number"
-                      placeholder="可用于登录，可不填写"
-                      :max-length="11"
-                    />
-                  </a-form-item>
+        <!-- 登录表单 -->
+        <form v-else class="login-form" @submit.prevent="handleLogin">
+          <input
+            v-model="loginForm.loginId"
+            class="field-input"
+            placeholder="UID或手机号"
+            autocomplete="username"
+            required
+          />
+          <input
+            v-model="loginForm.password"
+            type="password"
+            class="field-input"
+            placeholder="密码"
+            autocomplete="current-password"
+            required
+          />
+          <p v-if="errorMessage" class="form-error" role="alert">{{ errorMessage }}</p>
+          <button type="submit" class="primary-button" :disabled="loading || leaving || isLocked">
+            <span v-if="isLocked">账户已锁定 {{ formatTime(lockRemainingTime) }}</span>
+            <span v-else-if="loading || leaving">登录中…</span>
+            <span v-else>登录</span>
+          </button>
+        </form>
 
-                  <a-form-item
-                    label="密码"
-                    name="password"
-                    :rules="[
-                      { required: true, message: '请输入密码' },
-                      {
-                        min: MIN_PASSWORD_LENGTH,
-                        message: `密码至少需要 ${MIN_PASSWORD_LENGTH} 个字符`
-                      }
-                    ]"
-                  >
-                    <a-input-password
-                      v-model:value="adminForm.password"
-                      prefix-icon="lock"
-                      :minlength="MIN_PASSWORD_LENGTH"
-                    />
-                  </a-form-item>
-
-                  <a-form-item
-                    label="确认密码"
-                    name="confirmPassword"
-                    :rules="[
-                      { required: true, message: '请确认密码' },
-                      { validator: validateConfirmPassword }
-                    ]"
-                  >
-                    <a-input-password
-                      v-model:value="adminForm.confirmPassword"
-                      prefix-icon="lock"
-                    />
-                  </a-form-item>
-
-                  <a-form-item v-if="showAgreementConsent" class="agreement-form-item">
-                    <div class="agreement-row">
-                      <a-checkbox v-model:checked="agreementAccepted">
-                        登录即代表同意
-                        <a
-                          class="agreement-link"
-                          :href="userAgreementUrl"
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          @click.stop
-                          >《用户协议》</a
-                        >
-                        <a
-                          class="agreement-link"
-                          :href="privacyPolicyUrl"
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          @click.stop
-                          >《隐私协议》</a
-                        >
-                      </a-checkbox>
-                    </div>
-                  </a-form-item>
-
-                  <a-form-item>
-                    <a-button type="primary" html-type="submit" :loading="loading" block
-                      >创建管理员账户</a-button
-                    >
-                  </a-form-item>
-                </a-form>
-              </div>
-
-              <!-- 登录表单 -->
-              <div v-else class="login-form">
-                <a-form :model="loginForm" @finish="handleLogin" layout="vertical">
-                  <a-form-item
-                    label="登录账号"
-                    name="loginId"
-                    :rules="[{ required: true, message: '请输入UID或手机号' }]"
-                  >
-                    <a-input v-model:value="loginForm.loginId" placeholder="UID或手机号">
-                      <template #prefix>
-                        <user-icon size="18" />
-                      </template>
-                    </a-input>
-                  </a-form-item>
-
-                  <a-form-item
-                    label="密码"
-                    name="password"
-                    :rules="[{ required: true, message: '请输入密码' }]"
-                  >
-                    <a-input-password v-model:value="loginForm.password">
-                      <template #prefix>
-                        <lock-icon size="18" />
-                      </template>
-                    </a-input-password>
-                  </a-form-item>
-
-                  <a-form-item v-if="showAgreementConsent" class="agreement-form-item">
-                    <div class="agreement-row">
-                      <a-checkbox v-model:checked="agreementAccepted">
-                        登录即代表同意
-                        <a
-                          class="agreement-link"
-                          :href="userAgreementUrl"
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          @click.stop
-                          >《用户协议》</a
-                        >
-                        <a
-                          class="agreement-link"
-                          :href="privacyPolicyUrl"
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          @click.stop
-                          >《隐私协议》</a
-                        >
-                      </a-checkbox>
-                    </div>
-                  </a-form-item>
-
-                  <a-form-item>
-                    <a-button
-                      type="primary"
-                      html-type="submit"
-                      :loading="loading"
-                      :disabled="isLocked"
-                      block
-                      size="large"
-                    >
-                      <span v-if="isLocked">账户已锁定 {{ formatTime(lockRemainingTime) }}</span>
-                      <span v-else>登录</span>
-                    </a-button>
-                  </a-form-item>
-                </a-form>
-
-                <!-- OIDC 登录选项  -->
-                <div v-if="oidcChecking || oidcEnabled" class="third-party-login">
-                  <div class="divider">
-                    <span>或使用以下方式登录</span>
-                  </div>
-                  <div class="login-icons">
-                    <!-- 检查中显示骨架屏 -->
-                    <div v-if="oidcChecking" class="login-skeleton">
-                      <a-skeleton-button block size="large" :active="true" />
-                    </div>
-                    <!-- 检查完成后显示按钮 -->
-                    <a-button
-                      v-else
-                      type="default"
-                      size="large"
-                      block
-                      :loading="oidcLoading"
-                      @click="handleOIDCLogin"
-                    >
-                      <template #icon>
-                        <key-icon size="18" />
-                      </template>
-                      {{ oidcButtonText }}
-                    </a-button>
-                  </div>
-                </div>
-              </div>
-
-              <!-- 错误提示 -->
-              <div v-if="errorMessage" class="error-message">
-                {{ errorMessage }}
-              </div>
-            </div>
+        <!-- OIDC 登录选项 -->
+        <div v-if="!isFirstRun && mode === 'login' && (oidcChecking || oidcEnabled)" class="third-party">
+          <div class="divider"><span>或使用以下方式登录</span></div>
+          <div v-if="oidcChecking" class="oidc-skeleton">
+            <a-skeleton-button block size="large" :active="true" />
           </div>
+          <button
+            v-else
+            type="button"
+            class="secondary-button"
+            :disabled="leaving || oidcLoading"
+            @click="handleOIDCLogin"
+          >
+            <key-icon :size="16" class="oidc-icon" />
+            {{ oidcLoading ? '跳转中…' : oidcButtonText }}
+          </button>
         </div>
       </div>
-    </main>
 
-    <!-- 页面底部：版权信息等 -->
-    <footer class="page-footer">
-      <div class="footer-links">
-        <a href="https://github.com/xerrors" target="_blank">联系我们</a>
-        <span class="divider">|</span>
-        <a href="https://github.com/xerrors/Yuxi" target="_blank">使用帮助</a>
+      <!-- 页脚：惯用同意句式内嵌条款/隐私链接 -->
+      <div class="login-footer u-rise" style="animation-delay: 180ms">
+        <p class="footer-agree">
+          继续即表示你同意<template v-if="showAgreementConsent"
+            ><a class="u-link" :href="userAgreementUrl" target="_blank" rel="noopener noreferrer"
+              >使用条款</a
+            >，并已知悉<a
+              class="u-link"
+              :href="privacyPolicyUrl"
+              target="_blank"
+              rel="noopener noreferrer"
+              >隐私政策</a
+            >。</template
+          >
+          <template v-else>使用条款，并已知悉隐私政策。</template>
+        </p>
       </div>
-      <div class="copyright">
-        &copy; {{ new Date().getFullYear() }} {{ brandName }}. All Rights Reserved.
-      </div>
-    </footer>
+    </div>
   </div>
 </template>
 
@@ -288,11 +175,10 @@ import { message } from 'ant-design-vue'
 import { healthApi } from '@/apis/system_api'
 import { authApi } from '@/apis/auth_api'
 import {
-  User as UserIcon,
-  Lock as LockIcon,
   Key as KeyIcon,
   AlertCircle as ExclamationCircleIcon
 } from '@lucide/vue'
+import LoginScene from '@/components/LoginScene.vue'
 import { tryAutoStartOIDC, sanitizeRedirect } from '@/utils/oidcAutoStart'
 import { MIN_PASSWORD_LENGTH } from '@/utils/passwordValidation'
 
@@ -302,41 +188,20 @@ const userStore = useUserStore()
 const infoStore = useInfoStore()
 const agentStore = useAgentStore()
 
-// 品牌展示数据
-const loginBgImage = computed(() => {
-  return infoStore.organization?.login_bg || '/login-bg.jpg'
-})
-const brandLogo = computed(() => {
-  return infoStore.organization?.logo || ''
-})
-const brandOrgName = computed(() => {
-  return infoStore.organization?.name?.trim() || ''
-})
-const brandName = computed(() => {
-  const orgName = brandOrgName.value
-  const brandNameRaw = infoStore.branding?.name?.trim() || 'Yuxi'
-
-  if (orgName && brandNameRaw && orgName !== brandNameRaw) {
-    return brandNameRaw
-  }
-
-  return orgName || brandNameRaw
-})
-const userAgreementUrl = computed(() => {
-  return infoStore.footer?.user_agreement_url?.trim() || ''
-})
-const privacyPolicyUrl = computed(() => {
-  return infoStore.footer?.privacy_policy_url?.trim() || ''
-})
-const showAgreementConsent = computed(() => {
-  return Boolean(userAgreementUrl.value && privacyPolicyUrl.value)
-})
+// 品牌展示数据（固定品牌：Topuria）
+const brandName = 'Topuria'
+const tagline = '企业级双时态知识'
+const taglineSource = '知识库与智能体平台'
+const userAgreementUrl = computed(() => infoStore.footer?.user_agreement_url?.trim() || '')
+const privacyPolicyUrl = computed(() => infoStore.footer?.privacy_policy_url?.trim() || '')
+const showAgreementConsent = computed(() => Boolean(userAgreementUrl.value && privacyPolicyUrl.value))
 
 // 状态
+const mode = ref('login')
 const isFirstRun = ref(false)
 const loading = ref(false)
+const leaving = ref(false)
 const errorMessage = ref('')
-const agreementAccepted = ref(false)
 const serverStatus = ref('loading')
 const serverError = ref('')
 const healthChecking = ref(false)
@@ -360,15 +225,11 @@ const loginForm = reactive({
 
 // 管理员初始化表单
 const adminForm = reactive({
-  uid: '', // 改为直接输入uid
+  uid: '',
   password: '',
   confirmPassword: '',
-  phone_number: '' // 手机号字段（可选）
+  phone_number: ''
 })
-
-const goHome = () => {
-  router.push('/')
-}
 
 // 清理倒计时器
 const clearLockCountdown = () => {
@@ -413,35 +274,19 @@ const formatTime = (seconds) => {
   }
 }
 
-// 密码确认验证
-const validateConfirmPassword = async (rule, value) => {
-  if (value === '') {
-    throw new Error('请确认密码')
-  }
-  if (value !== adminForm.password) {
-    throw new Error('两次输入的密码不一致')
-  }
-}
-
-const ensureAgreementAccepted = () => {
-  if (!showAgreementConsent.value || agreementAccepted.value) {
-    return true
-  }
-
-  const warningMessage = '请先阅读并同意《用户协议》《隐私协议》'
-  message.warning(warningMessage)
-  return false
-}
-
 // 处理登录
 const handleLogin = async () => {
+  if (!loginForm.loginId.trim()) {
+    errorMessage.value = '请输入UID或手机号'
+    return
+  }
+  if (!loginForm.password) {
+    errorMessage.value = '请输入密码'
+    return
+  }
   // 如果当前被锁定，不允许登录
   if (isLocked.value) {
     message.warning(`账户被锁定，请等待 ${formatTime(lockRemainingTime.value)}`)
-    return
-  }
-
-  if (!ensureAgreementAccepted()) {
     return
   }
 
@@ -461,26 +306,28 @@ const handleLogin = async () => {
     const redirectPath = sessionStorage.getItem('redirect') || '/'
     sessionStorage.removeItem('redirect') // 清除重定向信息
 
-    // 根据用户角色决定重定向目标
-    if (redirectPath === '/') {
-      // 统一跳转到聊天页面（管理员与普通用户共享同一聊天界面）
-      try {
-        await agentStore.initialize()
-        router.push('/agent')
-      } catch (error) {
-        console.error('获取智能体信息失败:', error)
-        router.push('/agent')
+    // 谢幕：卡片上浮淡出、巨构放大穿越，再进入系统
+    leaving.value = true
+    window.setTimeout(async () => {
+      if (redirectPath === '/') {
+        // 统一跳转到聊天页面（管理员与普通用户共享同一聊天界面）
+        try {
+          await agentStore.initialize()
+          router.push('/agent')
+        } catch (error) {
+          console.error('获取智能体信息失败:', error)
+          router.push('/agent')
+        }
+      } else {
+        router.push(redirectPath)
       }
-    } else {
-      // 跳转到其他预设的路径
-      router.push(redirectPath)
-    }
+    }, 650)
   } catch (error) {
+    leaving.value = false
     console.error('登录失败:', error)
 
     // 检查是否是锁定错误（HTTP 423）
     if (error.status === 423) {
-      // 尝试从响应头中获取剩余时间
       let remainingTime = 0
       if (error.headers && error.headers.get) {
         const lockRemainingHeader = error.headers.get('X-Lock-Remaining')
@@ -488,15 +335,12 @@ const handleLogin = async () => {
           remainingTime = parseInt(lockRemainingHeader)
         }
       }
-
-      // 如果没有从头中获取到，尝试从错误消息中解析
       if (remainingTime === 0) {
         const lockTimeMatch = error.message.match(/(\d+)\s*秒/)
         if (lockTimeMatch) {
           remainingTime = parseInt(lockTimeMatch[1])
         }
       }
-
       if (remainingTime > 0) {
         startLockCountdown(remainingTime)
         errorMessage.value = `由于多次登录失败，账户已被锁定 ${formatTime(remainingTime)}`
@@ -513,23 +357,15 @@ const handleLogin = async () => {
 
 // 处理 OIDC 登录
 const handleOIDCLogin = async () => {
-  if (!ensureAgreementAccepted()) {
-    return
-  }
-
   try {
     oidcLoading.value = true
     errorMessage.value = ''
 
-    // 获取 OIDC 登录 URL
     const response = await authApi.getOIDCLoginUrl()
     if (response.login_url) {
-      // 保存当前路径，以便登录后返回
       const redirectPath =
         sessionStorage.getItem('redirect') || router.currentRoute.value.query.redirect || '/'
       sessionStorage.setItem('oidc_redirect', redirectPath)
-
-      // 跳转到 OIDC Provider
       window.location.href = response.login_url
     } else {
       errorMessage.value = '获取 OIDC 登录地址失败'
@@ -563,7 +399,29 @@ const checkOIDCConfig = async () => {
 
 // 处理初始化管理员
 const handleInitialize = async () => {
-  if (!ensureAgreementAccepted()) {
+  const uid = adminForm.uid.trim()
+  if (!uid) {
+    errorMessage.value = '请输入UID'
+    return
+  }
+  if (!/^[a-zA-Z0-9_]+$/.test(uid)) {
+    errorMessage.value = 'UID只能包含字母、数字和下划线'
+    return
+  }
+  if (uid.length < 3 || uid.length > 20) {
+    errorMessage.value = 'UID长度必须在3-20个字符之间'
+    return
+  }
+  if (adminForm.phone_number && !/^1[3-9]\d{9}$/.test(adminForm.phone_number.trim())) {
+    errorMessage.value = '请输入正确的手机号格式'
+    return
+  }
+  if (!adminForm.password || adminForm.password.length < MIN_PASSWORD_LENGTH) {
+    errorMessage.value = `密码至少需要 ${MIN_PASSWORD_LENGTH} 个字符`
+    return
+  }
+  if (adminForm.password !== adminForm.confirmPassword) {
+    errorMessage.value = '两次输入的密码不一致'
     return
   }
 
@@ -571,15 +429,10 @@ const handleInitialize = async () => {
     loading.value = true
     errorMessage.value = ''
 
-    if (adminForm.password !== adminForm.confirmPassword) {
-      errorMessage.value = '两次输入的密码不一致'
-      return
-    }
-
     await userStore.initialize({
-      uid: adminForm.uid,
+      uid,
       password: adminForm.password,
-      phone_number: adminForm.phone_number || null // 空字符串转为null
+      phone_number: adminForm.phone_number || null
     })
 
     message.success('管理员账户创建成功')
@@ -665,402 +518,324 @@ onUnmounted(() => {
 })
 </script>
 
-<style lang="less" scoped>
-.login-view {
+<style scoped>
+.login-page {
+  position: relative;
   min-height: 100vh;
-  width: 100%;
-  position: relative;
   display: flex;
-  flex-direction: column;
-  background-color: var(--gray-10);
-  background-image: radial-gradient(var(--gray-200) 1px, transparent 1px);
-  background-size: 24px 24px;
-
-  &.has-alert {
-    padding-top: 60px;
-  }
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: #fafafa;
 }
 
-/* Unified Navbar */
-.login-navbar {
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: 100%;
-  padding: 32px 0;
+.login-column {
+  position: relative;
   z-index: 10;
-
-  .navbar-content {
-    max-width: 1500px; /* Constraint the width */
-    margin: 0 auto;
-    padding: 0 40px;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    .brand-container {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-    }
-  }
-}
-
-.brand-text {
-  margin: 0;
-  font-size: 20px;
-  font-weight: 600;
-  line-height: 1;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-
-  .brand-org {
-    color: var(--gray-700);
-    font-weight: 600;
-  }
-
-  .brand-separator {
-    width: 4px;
-    height: 4px;
-    background-color: var(--gray-400);
-    border-radius: 50%;
-    font-weight: 600;
-  }
-
-  .brand-main {
-    color: var(--main-color);
-    font-weight: 600;
-  }
-}
-
-.brand-logo {
-  height: 32px;
-  width: auto;
-  object-fit: contain;
-}
-
-.top-logo {
-  height: 32px;
-  width: auto;
-  object-fit: contain;
-}
-
-.back-home-btn {
-  color: var(--gray-600);
-  font-size: 14px;
-  &:hover {
-    color: var(--main-color);
-    background-color: transparent;
-  }
-}
-
-/* Main Content: Card Layout */
-.login-main {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 20px;
-  padding-top: 80px; /* Add space for navbar */
-}
-
-.login-card {
-  width: 900px;
-  max-width: 95vw;
-  height: 560px;
-  background: var(--gray-0);
-  border-radius: 16px;
-  box-shadow: 0 0px 40px var(--shadow-1);
-  display: flex;
-  overflow: hidden;
-}
-
-.card-side {
-  position: relative;
-}
-
-/* Image Side */
-.card-side.is-image {
-  flex: 1.4;
-  background-color: var(--main-10);
-  overflow: hidden;
-
-  .login-bg-image {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-    object-position: center;
-  }
-}
-
-/* Form Side */
-.card-side.is-form {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 40px;
-}
-
-.form-wrapper {
   width: 100%;
-  max-width: 320px;
-  display: flex;
-  flex-direction: column;
-  gap: 32px;
+  max-width: 384px;
 }
 
-.form-header {
-  text-align: left;
-  .welcome-text {
-    font-size: 14px;
-    font-weight: 600;
-    color: var(--gray-500);
-    margin-bottom: 4px;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-  }
-  .init-title {
-    font-size: 18px;
-    font-weight: 600;
-    color: var(--main-color);
-    margin: 0;
-    line-height: 1.4;
-  }
+/* ---- 品牌区 ---- */
+.brand-hero {
+  margin-bottom: 32px;
+  text-align: center;
+}
+
+.brand-title {
+  font-size: 48px;
+  line-height: 1;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: #171717;
+}
+
+.brand-tagline {
+  margin-top: 8px;
+  font-size: 14px;
+  line-height: 22px;
+  color: #5f5f5f;
+}
+
+.brand-tagline-source {
+  margin-left: 8px;
+  font-size: 12px;
+  line-height: 16px;
+  color: #8a8a8a;
+}
+
+/* ---- 卡片 ---- */
+.login-card {
+  background: #ffffff;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 14px;
+  padding: 24px;
+}
+
+.segmented {
+  display: flex;
+  gap: 4px;
+  background: #f6f6f6;
+  padding: 4px;
+  border-radius: 10px;
+  margin-bottom: 24px;
+}
+
+.segmented-item {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  border: none;
+  background: transparent;
+  border-radius: 10px;
+  padding: 4px 12px;
+  font-size: 13px;
+  line-height: 20px;
+  font-weight: 500;
+  color: #5f5f5f;
+  cursor: pointer;
+  transition:
+    background-color 0.15s,
+    color 0.15s;
+}
+
+.segmented-item:hover {
+  background: #f0f0f0;
+  color: #171717;
+}
+
+.segmented-item.active {
+  background: #e9e9e9;
+  color: #171717;
+}
+
+.register-notice {
+  padding: 28px 8px;
+  text-align: center;
+  font-size: 13px;
+  line-height: 20px;
+  color: #5f5f5f;
 }
 
 .login-form {
-  :deep(.ant-input-affix-wrapper) {
-    padding: 10px 12px;
-    border-radius: 8px;
-  }
-  :deep(.ant-btn) {
-    height: 44px;
-    font-size: 16px;
-    border-radius: 8px;
-  }
-  :deep(.ant-input-prefix) {
-    margin-right: 8px;
-    color: var(--gray-500);
-  }
-}
-
-.login-form.login-form--init :deep(.ant-form-item) {
-  margin-bottom: 14px;
-}
-
-.third-party-login {
-  margin-top: 16px;
-  .divider {
-    position: relative;
-    text-align: center;
-    margin: 24px 0 16px;
-    &::before,
-    &::after {
-      content: '';
-      position: absolute;
-      top: 50%;
-      width: 30%;
-      height: 1px;
-      background-color: var(--gray-200);
-    }
-    &::before {
-      left: 0;
-    }
-    &::after {
-      right: 0;
-    }
-    span {
-      display: inline-block;
-      padding: 0 8px;
-      background-color: var(--gray-0);
-      color: var(--gray-400);
-      font-size: 12px;
-    }
-  }
-
-  .login-icons {
-    :deep(.ant-btn) {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 8px;
-      border-color: var(--gray-300);
-      color: var(--gray-700);
-
-      &:hover {
-        border-color: var(--main-color);
-        color: var(--main-color);
-        background-color: var(--main-10);
-      }
-
-      .anticon,
-      svg {
-        color: var(--main-color);
-      }
-    }
-  }
-
-  /* 修复：添加骨架屏样式 */
-  .login-skeleton {
-    :deep(.ant-skeleton-button) {
-      width: 100% !important;
-      height: 44px;
-      border-radius: 8px;
-    }
-  }
-}
-
-.agreement-form-item {
-  margin-bottom: 12px;
-}
-
-.agreement-row {
-  font-size: 13px;
-  color: var(--gray-600);
-  line-height: 1.6;
-
-  :deep(.ant-checkbox-wrapper) {
-    display: inline-flex;
-    align-items: flex-start;
-  }
-
-  :deep(.ant-checkbox + span) {
-    padding-inline-start: 8px;
-  }
-}
-
-.agreement-link {
-  color: var(--main-color);
-
-  &:hover {
-    text-decoration: underline;
-  }
-}
-
-.error-message {
-  margin-top: 16px;
-  padding: 10px 12px;
-  background-color: var(--color-error-50);
-  border: 1px solid color-mix(in srgb, var(--color-error-500) 25%, transparent);
-  border-radius: 6px;
-  color: var(--color-error-700);
-  font-size: 13px;
-  text-align: center;
-}
-
-/* Page Footer */
-.page-footer {
-  padding: 24px;
-  text-align: center;
-}
-
-.footer-links {
   display: flex;
-  justify-content: center;
-  align-items: center;
-  gap: 16px;
-  margin-bottom: 8px;
-
-  a {
-    color: var(--gray-500);
-    font-size: 13px;
-    &:hover {
-      color: var(--main-color);
-    }
-  }
-
-  .divider {
-    color: var(--gray-300);
-    font-size: 12px;
-  }
+  flex-direction: column;
+  gap: 12px;
 }
 
-.copyright {
+.init-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: #171717;
+  margin-bottom: 4px;
+}
+
+.field-label {
   font-size: 12px;
-  color: var(--gray-400);
+  line-height: 16px;
+  color: #5f5f5f;
+  margin-top: 4px;
 }
 
-/* Server Status Alert */
+.field-input {
+  width: 100%;
+  height: 40px;
+  border: 1px solid #e4e4e4;
+  border-radius: 10px;
+  padding: 0 12px;
+  font-size: 14px;
+  color: #171717;
+  background: #fff;
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.field-input::placeholder {
+  color: #9b9b9b;
+}
+
+.field-input:focus {
+  border-color: #008580;
+}
+
+/* Chrome 自动填充的蓝底与中性设计冲突：压回白色 */
+.field-input:-webkit-autofill,
+.field-input:-webkit-autofill:hover,
+.field-input:-webkit-autofill:focus {
+  -webkit-box-shadow: 0 0 0 1000px #fff inset;
+  -webkit-text-fill-color: #171717;
+  transition: background-color 5000s ease-in-out 0s;
+}
+
+.form-error {
+  font-size: 13px;
+  line-height: 20px;
+  color: #b3261e;
+}
+
+.primary-button {
+  width: 100%;
+  height: 40px;
+  border: none;
+  border-radius: 10px;
+  background: #008580;
+  color: #fff;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.15s;
+}
+
+.primary-button:hover:not(:disabled) {
+  background: #00746f;
+}
+
+.primary-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* ---- OIDC ---- */
+.third-party {
+  margin-top: 4px;
+}
+
+.divider {
+  margin: 16px 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 12px;
+  line-height: 16px;
+  color: #5f5f5f;
+}
+
+.divider::before,
+.divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: rgba(0, 0, 0, 0.08);
+}
+
+.secondary-button {
+  width: 100%;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 1px solid rgba(0, 0, 0, 0.14);
+  border-radius: 10px;
+  background: #fff;
+  color: #171717;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.15s;
+}
+
+.secondary-button:hover:not(:disabled) {
+  background: #f5f5f5;
+}
+
+.secondary-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* ---- 页脚 ---- */
+.login-footer {
+  margin-top: 24px;
+  text-align: center;
+}
+
+.footer-agree {
+  font-size: 12px;
+  line-height: 20px;
+  color: #5f5f5f;
+  text-wrap: balance;
+}
+
+.u-link {
+  color: #171717;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-color: rgba(23, 23, 23, 0.3);
+  white-space: nowrap;
+}
+
+.u-link:hover {
+  text-decoration-color: rgba(23, 23, 23, 0.8);
+}
+
+/* ---- 服务状态提示 ---- */
 .server-status-alert {
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  padding: 12px 20px;
-  background: var(--color-error-500);
-  color: var(--gray-0);
-  z-index: 1000;
+  position: fixed;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: #fff;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-left: 3px solid #b3261e;
+  border-radius: 10px;
+  padding: 10px 14px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.08);
+}
 
-  .alert-content {
-    display: flex;
-    align-items: center;
-    max-width: 1500px;
-    margin: 0 auto;
+.alert-icon {
+  color: #b3261e;
+  flex-shrink: 0;
+}
 
-    .alert-icon {
-      font-size: 20px;
-      margin-right: 12px;
-      color: var(--gray-0);
-    }
+.alert-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #171717;
+}
 
-    .alert-text {
-      flex: 1;
+.alert-message {
+  font-size: 12px;
+  color: #5f5f5f;
+}
 
-      .alert-title {
-        font-weight: 600;
-        font-size: 16px;
-        margin-bottom: 2px;
-      }
-
-      .alert-message {
-        font-size: 14px;
-        opacity: 0.9;
-      }
-    }
-
-    :deep(.ant-btn-link) {
-      color: var(--gray-0);
-      border-color: var(--gray-0);
-
-      &:hover {
-        color: var(--gray-0);
-        background-color: color-mix(in srgb, var(--gray-0) 10%, transparent);
-      }
-    }
+/* ---- 入场 / 谢幕动效（移植自 utopia styles.css） ---- */
+@keyframes u-rise-kf {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
   }
 }
 
-/* Responsive */
-@media (max-width: 1280px) {
-  .login-navbar .navbar-content {
-    padding: 0 40px;
+.u-rise {
+  animation: u-rise-kf 0.7s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes u-depart-kf {
+  to {
+    opacity: 0;
+    transform: translateY(-14px);
   }
 }
 
-@media (max-width: 768px) {
-  .login-navbar .navbar-content {
-    padding: 0 20px;
-  }
+.login-column.is-leaving {
+  animation: u-depart-kf 0.55s cubic-bezier(0.5, 0, 0.9, 0.4) forwards;
+}
 
-  .brand-text {
-    font-size: 20px;
-  }
-
-  .login-card {
-    flex-direction: column;
-    height: auto;
-    max-height: none;
-    width: 100%;
-    margin-top: 20px;
-  }
-
-  .card-side.is-image {
-    display: none;
-  }
-
-  .card-side.is-form {
-    padding: 40px 20px;
+@media (prefers-reduced-motion: reduce) {
+  .u-rise,
+  .login-column.is-leaving {
+    animation: none;
   }
 }
 </style>

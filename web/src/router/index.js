@@ -17,8 +17,10 @@ const router = createRouter({
         {
           path: '',
           name: 'Home',
-          component: () => import('../views/HomeView.vue'),
-          meta: { keepAlive: true, requiresAuth: false }
+          redirect: () => {
+            const userStore = useUserStore()
+            return userStore.isLoggedIn ? '/agent' : '/login'
+          }
         }
       ]
     },
