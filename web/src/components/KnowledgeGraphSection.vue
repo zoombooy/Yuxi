@@ -11,7 +11,7 @@
       <div v-else class="graph-wrapper">
         <GraphCanvas
           ref="graphRef"
-          :graph-data="graph.graphData"
+          :graph-data="displayGraphData"
           @node-click="handleGraphNodeClick"
           @edge-click="handleGraphEdgeClick"
           @canvas-click="graph.handleCanvasClick"
@@ -47,9 +47,33 @@
                   <Settings :size="16" />
                 </a-button>
               </div>
-              <div v-if="isMilvus && !readonly" class="actions-right">
+              <div v-if="isMilvus" class="actions-right">
                 <a-button
-                  v-if="isMilvus && !readonly"
+                  class="action-btn timeline-action-btn"
+                  :class="{ 'has-index-label': timelineActive }"
+                  @click="toggleTimelinePanel"
+                  title="时间轴：拖动查看图谱演变"
+                  aria-label="时间轴"
+                >
+                  <History :size="16" />
+                  <span v-if="timelineActive" class="index-status-label">时间轴中</span>
+                </a-button>
+                <a-button
+                  v-if="!readonly"
+                  class="action-btn governance-action-btn"
+                  :class="{ 'has-index-label': pendingFactsCount > 0 }"
+                  @click="toggleGovernancePanel"
+                  :title="pendingFactsCount > 0 ? `知识治理（${pendingFactsCount} 条待审）` : '知识治理'"
+                  aria-label="知识治理"
+                >
+                  <ShieldCheck :size="16" />
+                  <span v-if="pendingFactsCount > 0" class="index-status-label"
+                    >{{ pendingFactsCount }} 待审核</span
+                  >
+                  <span v-if="pendingFactsCount > 0" class="status-dot status-dot--pending"></span>
+                </a-button>
+                <a-button
+                  v-if="!readonly"
                   class="action-btn index-action-btn"
                   :class="{ 'has-index-label': hasPendingGraphChunks }"
                   @click="toggleBuildPanel"
@@ -71,7 +95,7 @@
           </template>
         </GraphCanvas>
         <ResourceEmptyState
-          v-if="showGraphConfigEmpty"
+          v-if="showGraphConfigEmpty && !timelineActive"
           class="graph-empty-state"
           title="暂无知识图谱"
           :description="
@@ -90,7 +114,7 @@
           </template>
         </ResourceEmptyState>
         <ResourceEmptyState
-          v-else-if="showGraphDataEmpty"
+          v-else-if="showGraphDataEmpty && !timelineActive"
           class="graph-empty-state"
           :title="graphDataEmptyTitle"
           :description="graphDataEmptyDescription"
@@ -273,6 +297,25 @@
             </div>
           </div>
         </transition>
+
+        <!-- 知识治理浮动面板 -->
+        <KnowledgeGovernancePanel
+          v-if="isMilvus"
+          :visible="showGovernance"
+          :kb-id="kbId"
+          :readonly="readonly"
+          @close="showGovernance = false"
+          @changed="loadGraphBuildStatus"
+        />
+
+        <!-- 图谱时间轴底栏 -->
+        <KnowledgeGraphTimeline
+          v-if="isMilvus"
+          :visible="timelineActive"
+          :kb-id="kbId"
+          @close="timelineActive = false"
+          @update="onTimelineUpdate"
+        />
       </div>
     </div>
 
@@ -385,11 +428,15 @@ import {
   Search,
   Loader2,
   Database,
-  Network
+  Network,
+  ShieldCheck,
+  History
 } from '@lucide/vue'
 import GraphCanvas from '@/components/GraphCanvas.vue'
 import GraphDetailPanel from '@/components/GraphDetailPanel.vue'
 import ResourceEmptyState from '@/components/shared/ResourceEmptyState.vue'
+import KnowledgeGovernancePanel from '@/components/KnowledgeGovernancePanel.vue'
+import KnowledgeGraphTimeline from '@/components/KnowledgeGraphTimeline.vue'
 import { getKbTypeLabel } from '@/utils/kb_utils'
 import { unifiedApi } from '@/apis/graph_api'
 import { graphBuildApi } from '@/apis/knowledge_api'
@@ -484,16 +531,58 @@ const graphIndexButtonTitle = computed(() => {
   return '索引管理'
 })
 
+const showGovernance = ref(false)
+const pendingFactsCount = computed(() => Number(graphBuildStatus.value?.fact_counts?.pending || 0))
+const timelineActive = ref(false)
+const timelineGraphData = ref(null)
+
+const closeOtherPanels = () => {
+  showBuildPanel.value = false
+  showSettings.value = false
+  showGovernance.value = false
+  timelineActive.value = false
+}
+
 const toggleBuildPanel = () => {
   showBuildPanel.value = !showBuildPanel.value
   showSettings.value = false
+  showGovernance.value = false
+  timelineActive.value = false
   if (showBuildPanel.value) graph.handleCanvasClick()
 }
 
 const toggleSettingsPanel = () => {
   showSettings.value = !showSettings.value
   showBuildPanel.value = false
+  showGovernance.value = false
+  timelineActive.value = false
   if (showSettings.value) graph.handleCanvasClick()
+}
+
+const toggleGovernancePanel = () => {
+  showGovernance.value = !showGovernance.value
+  showBuildPanel.value = false
+  showSettings.value = false
+  timelineActive.value = false
+  if (showGovernance.value) graph.handleCanvasClick()
+}
+
+// 时间轴模式：激活时画布渲染"该时点成立的事实"重建的图
+const toggleTimelinePanel = () => {
+  timelineActive.value = !timelineActive.value
+  showBuildPanel.value = false
+  showSettings.value = false
+  showGovernance.value = false
+  if (timelineActive.value) graph.handleCanvasClick()
+}
+
+const displayGraphData = computed(() => {
+  if (timelineActive.value && timelineGraphData.value) return timelineGraphData.value
+  return graph.graphData
+})
+
+const onTimelineUpdate = (payload) => {
+  timelineGraphData.value = payload?.graphData || { nodes: [], edges: [] }
 }
 
 const handleGraphNodeClick = (nodeData) => {

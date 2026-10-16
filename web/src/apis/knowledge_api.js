@@ -359,6 +359,39 @@ export const graphBuildApi = {
 }
 
 // =============================================================================
+// === 知识治理分组 ===
+// =============================================================================
+
+function governanceUrl(kbId, action) {
+  return `/api/knowledge/databases/${kbId}/governance/${action}`
+}
+
+export const governanceApi = {
+  getConfig: async (kbId) => {
+    return apiAdminGet(governanceUrl(kbId, 'config'))
+  },
+
+  updateConfig: async (kbId, data) => {
+    return apiAdminPut(governanceUrl(kbId, 'config'), data)
+  },
+
+  listFacts: async (kbId, params = {}) => {
+    const query = new URLSearchParams()
+    if (params.status) query.set('status', params.status)
+    if (params.file_id) query.set('file_id', params.file_id)
+    if (params.as_of) query.set('as_of', params.as_of)
+    if (params.subject) query.set('subject', params.subject)
+    query.set('page', params.page ?? 1)
+    query.set('page_size', params.page_size ?? 20)
+    return apiAdminGet(`${governanceUrl(kbId, 'facts')}?${query.toString()}`)
+  },
+
+  decideFact: async (kbId, factId, decision) => {
+    return apiAdminPost(governanceUrl(kbId, `facts/${factId}/decision`), { decision })
+  }
+}
+
+// =============================================================================
 // === 思维导图分组 ===
 // =============================================================================
 
